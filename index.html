@@ -584,6 +584,77 @@ function parseHexInput(input) {
 }
 
 /**
+ * parseMultiFrames - 从任意格式的文本中切割出多条IEC 104报文
+ * 自动忽略所有前缀（如R00:02:27、S00:02:27、时间戳、注释等），
+ * 仅以 0x68 启动字符 + 第2字节长度字段 为准切割完整报文。
+ * 支持：单条报文、多行带前缀报文、跨行续行报文、一行多条报文。
+ * @param {string} input - 任意格式的文本，内含十六进制报文
+ * @returns {object[]|null} 报文数组，每项 {dir, time, bytes, rawHex}
+ */
+function parseMultiFrames(input) {
+  if (!input || !input.trim()) return null;
+  var lines = input.split(/\r?\n/);
+  var allBytes = [];
+  var lineInfo = [];
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) continue;
+
+    // 提取方向和时间（可选，用于显示）
+    var dir = '', time = '';
+    var m = line.match(/^([RSrsTt])\s*(\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)?\s*(.*)$/);
+    if (m) {
+      dir = m[1].toUpperCase();
+      time = m[2] || '';
+      line = m[3];
+    }
+
+    // 解析该行的十六进制字节
+    var cleaned = line.replace(/[,;:\s]+/g, ' ').trim();
+    if (!cleaned) continue;
+    var parts = cleaned.split(' ');
+    for (var j = 0; j < parts.length; j++) {
+      var p = parts[j].trim();
+      if (!p) continue;
+      if (p.indexOf('0x') === 0 || p.indexOf('0X') === 0) p = p.substring(2);
+      if (p.length && p[p.length - 1] === 'h') p = p.substring(0, p.length - 1);
+      var val = parseInt(p, 16);
+      if (isNaN(val) || val < 0 || val > 255) continue;
+      allBytes.push(val);
+      lineInfo.push({ dir: dir, time: time });
+    }
+  }
+
+  if (allBytes.length < 6) return null;
+
+  // 按 0x68 + 长度字段 切割报文
+  var messages = [];
+  var idx = 0;
+  while (idx < allBytes.length) {
+    if (allBytes[idx] !== 0x68) { idx++; continue; }
+    if (idx + 1 >= allBytes.length) break;
+    var len = allBytes[idx + 1];
+    var total = len + 2;
+    if (total < 6 || total > 255 + 2 || idx + total > allBytes.length) {
+      idx++;
+      continue;
+    }
+    // 再验证一下：第6字节后如果还有ASDU，合理性检查（非必须，跳过）
+    var msgBytes = allBytes.slice(idx, idx + total);
+    var msgDir = lineInfo[idx] ? lineInfo[idx].dir : '';
+    var msgTime = lineInfo[idx] ? lineInfo[idx].time : '';
+    var hexStr = msgBytes.map(function(x){
+      return x.toString(16).toUpperCase().padStart(2,'0');
+    }).join(' ');
+    messages.push({ dir: msgDir, time: msgTime, bytes: msgBytes, rawHex: hexStr });
+    idx += total;
+  }
+
+  return messages.length > 0 ? messages : null;
+}
+
+/**
  * parseAPCI - 解析APCI层
  * @param {number[]} bytes - 报文字节数组
  * @returns {object} APCI解析结果
