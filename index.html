@@ -424,6 +424,7 @@ body {
     <button class="btn-example" onclick="loadExample('iframe_msp')">I帧-单点</button>
     <button class="btn-example" onclick="loadExample('iframe_float')">I帧-浮点</button>
     <button class="btn-example" onclick="loadExample('interrogation')">总召唤</button>
+    <button class="btn-example" onclick="loadExample('multi_log')">批量日志</button>
   </div>
 
   <!-- 端口状态 -->
@@ -871,13 +872,15 @@ function diagnoseContext(port, frameType, ns, nr, uFuncType) {
     ctx.lastNS = ns;
     ctx.lastNR = nr;
   } else if (frameType === 'S') {
-    // 检查S帧N(R)是否确认了之前发送的I帧
+    // 检查S帧N(R)是否确认了之前收到的I帧
+    // N(R)表示期望下一个收到的I帧N(S)，正常确认时 N(R) <= lastNS + 1
     if (ctx.lastNS !== null) {
-      if (nr <= ctx.lastNS) {
-        result.messages.push('[端口' + port + '] S帧确认N(R)=' + nr + '，已确认到I帧N(S)=' + (nr - 1 < 0 ? nr - 1 + 32768 : nr - 1));
+      if (nr <= ctx.lastNS + 1) {
+        var confirmedNS = (nr - 1 < 0) ? nr - 1 + 32768 : nr - 1;
+        result.messages.push('[端口' + port + '] S帧确认N(R)=' + nr + '，已确认到I帧N(S)=' + confirmedNS);
       } else {
         result.level = 'warn';
-        result.messages.push('警告：[端口' + port + '] S帧确认号N(R)=' + nr + '异常，超出已发I帧N(S)=' + ctx.lastNS);
+        result.messages.push('警告：[端口' + port + '] S帧确认号N(R)=' + nr + '异常，超出已收I帧N(S)+1=' + (ctx.lastNS + 1));
       }
     } else {
       result.messages.push('[端口' + port + '] S帧N(R)=' + nr + '，无先前I帧记录');
@@ -1057,51 +1060,140 @@ function renderHistory() {
 /* ==========================================================
    主解析入口
    ========================================================== */
-function onParse() {
-  var input = document.getElementById('hexInput').value;
-  var bytes = parseHexInput(input);
 
-  if (!bytes || bytes.length < 2) {
-    document.getElementById('resultSection').innerHTML =
-      '<div class="card"><div class="card-title apci" style="color:#e94560">解析失败</div>' +
-      '<div class="field-value warn">无法解析输入，请检查十六进制格式</div></div>';
-    return;
+/**
+ * formatResultInner - 渲染解析内容（无外层card包裹），供单条/批量复用
+ */
+function formatResultInner(bytes, apci, asdu, lenCheck, diag) {
+  var html = '';
+  if (lenCheck.ok) {
+    html += '<div class="len-ok">\u2705 长度校验通过（Length=' + lenCheck.lengthField + '，实际=' + lenCheck.actualLength + '）</div>';
+  } else {
+    html += '<div class="len-fail">\uD83D\uDEA8 长度异常！期望 ' + lenCheck.lengthField + ' 字节，实际 ' + lenCheck.actualLength + ' 字节</div>';
   }
+  html += '<div class="field"><span class="field-label">启动字符</span><span class="field-value">0x' + apci.startChar.toString(16).toUpperCase().padStart(2, '0') + (apci.startChar === 0x68 ? ' (68H\u2714)' : ' (\u26A0非68H)') + '</span></div>';
+  html += '<div class="field"><span class="field-label">APDU长度</span><span class="field-value' + (lenCheck.ok ? ' highlight' : ' warn') + '">' + apci.lengthField + ' 字节</span></div>';
+  html += '<div class="field"><span class="field-label">帧类型</span><span class="field-value highlight">' + apci.frameType + '帧</span></div>';
+  html += '<div class="field"><span class="field-label">控制域</span><span class="field-value" style="font-family:monospace">' +
+    '0x' + apci.controlField[0].toString(16).toUpperCase().padStart(2,'0') + ' ' +
+    '0x' + apci.controlField[1].toString(16).toUpperCase().padStart(2,'0') + ' ' +
+    '0x' + apci.controlField[2].toString(16).toUpperCase().padStart(2,'0') + ' ' +
+    '0x' + apci.controlField[3].toString(16).toUpperCase().padStart(2,'0') + '</span></div>';
+  if (apci.frameType === 'I') {
+    html += '<div class="field"><span class="field-label">N(S) 发送序列号</span><span class="field-value info">' + apci.ns + '</span></div>';
+    html += '<div class="field"><span class="field-label">N(R) 接收序列号</span><span class="field-value info">' + apci.nr + '</span></div>';
+  } else if (apci.frameType === 'S') {
+    html += '<div class="field"><span class="field-label">N(R) 接收序列号</span><span class="field-value info">' + apci.nr + '</span></div>';
+  } else if (apci.frameType === 'U') {
+    html += '<div class="field"><span class="field-label">U帧功能</span><span class="field-value highlight">' + apci.uFuncName + '</span></div>';
+  }
+  if (asdu) {
+    html += '<div style="margin-top:6px;padding-top:4px;border-top:1px dashed #0f346066"></div>';
+    html += '<div class="field"><span class="field-label">类型标识 (TYPE ID)</span><span class="field-value highlight">' + asdu.typeId + ' - ' + asdu.typeName + '</span></div>';
+    html += '<div class="field"><span class="field-label">VSQ</span><span class="field-value">0x' + asdu.vsq.toString(16).toUpperCase().padStart(2,'0') + '</span></div>';
+    html += '<div class="field"><span class="field-label">信息体个数</span><span class="field-value info">' + asdu.infoObjCount + '</span></div>';
+    html += '<div class="field"><span class="field-label">传输方式</span><span class="field-value">' + (asdu.sq ? '顺序传输 (SQ=1)' : '非顺序传输 (SQ=0)') + '</span></div>';
+    html += '<div class="field"><span class="field-label">传送原因 (COT)</span><span class="field-value">' + asdu.cot + ' - ' + asdu.cotName + '</span></div>';
+    html += '<div class="field"><span class="field-label">原地址 (OA)</span><span class="field-value">' + asdu.oa + '</span></div>';
+    html += '<div class="field"><span class="field-label">公共地址 (CA)</span><span class="field-value info">' + asdu.ca + '</span></div>';
+    if (asdu.ioa !== null) {
+      html += '<div class="field"><span class="field-label">信息对象地址 (IOA)</span><span class="field-value info">' + asdu.ioa + ' (' + asdu.ioaHex + ')</span></div>';
+    }
+    if (asdu.timestampStr) {
+      html += '<div class="field"><span class="field-label">时标 (CP56Time2a)</span><span class="field-value highlight">' + asdu.timestampStr + '</span></div>';
+    }
+    html += '<div class="field"><span class="field-label">ASDU原始</span><span class="field-value" style="font-family:monospace;font-size:12px;word-break:break-all">' +
+      asdu.rawAsdu.map(function(b){ return b.toString(16).toUpperCase().padStart(2,'0'); }).join(' ') + '</span></div>';
+  }
+  html += '<div style="margin-top:6px;padding-top:4px;border-top:1px dashed #0f346066"></div>';
+  for (var i = 0; i < diag.messages.length; i++) {
+    var cls = diag.level === 'warn' ? 'diag-warn' : (diag.level === 'info' ? 'diag-info' : 'diag-ok');
+    html += '<div class="' + cls + '">' + diag.messages[i] + '</div>';
+  }
+  return html;
+}
 
+/**
+ * renderOneMessage - 渲染批量模式下单条报文卡片
+ */
+function renderOneMessage(msg, idx) {
+  var bytes = msg.bytes;
+  var html = '';
+  var borderColor = msg.dir === 'R' ? '#00ff88' : (msg.dir === 'S' ? '#ff9f43' : '#00d2ff');
+  html += '<div class="card" style="border-left:4px solid ' + borderColor + '">';
+  var dirTag = msg.dir ? '<span style="color:' + (msg.dir === 'R' ? '#00ff88' : '#ff9f43') + ';font-weight:700">[' + msg.dir + ']</span>' : '';
+  var timeTag = msg.time ? '<span style="color:#80a0c0">' + msg.time + '</span>' : '';
+  html += '<div class="card-title apci" style="font-size:14px">#' + idx + ' ' + dirTag + ' ' + timeTag + '</div>';
+  html += '<div class="field"><span class="field-label">原始报文</span><span class="field-value" style="font-family:monospace;font-size:12px;word-break:break-all">' + msg.rawHex + '</span></div>';
   if (bytes.length < 6) {
-    document.getElementById('resultSection').innerHTML =
-      '<div class="card"><div class="card-title apci" style="color:#e94560">报文过短</div>' +
-      '<div class="field-value warn">APDU至少需要6字节（启动字符+长度+4控制域），当前仅' + bytes.length + '字节</div></div>';
-    return;
+    html += '<div class="field-value warn">报文过短，APDU至少需要6字节</div></div>';
+    return html;
   }
-
-  // 检查启动字符
   if (bytes[0] !== 0x68) {
-    document.getElementById('resultSection').innerHTML =
-      '<div class="card"><div class="card-title apci" style="color:#e94560">启动字符错误</div>' +
-      '<div class="field-value warn">首字节应为0x68，当前为0x' + bytes[0].toString(16).toUpperCase() + '</div></div>';
-    return;
+    html += '<div class="field-value warn">启动字符错误，应为0x68</div></div>';
+    return html;
   }
-
-  // 解析
   var apci = parseAPCI(bytes);
   var asdu = parseASDU(bytes);
   var lenCheck = validateLength(bytes);
   var diag = diagnoseContext(currentPort, apci.frameType, apci.ns, apci.nr, apci.uFuncType);
+  html += formatResultInner(bytes, apci, asdu, lenCheck, diag);
+  html += '</div>';
+  return html;
+}
 
-  // 渲染结果
-  var html = formatResult(bytes, apci, asdu, lenCheck, diag);
+function onParse() {
+  var input = document.getElementById('hexInput').value;
+  var messages = parseMultiFrames(input);
+
+  if (!messages || messages.length === 0) {
+    document.getElementById('resultSection').innerHTML =
+      '<div class="card"><div class="card-title apci" style="color:#e94560">解析失败</div>' +
+      '<div class="field-value warn">未找到有效的IEC 104报文（未检测到0x68启动字符）</div></div>';
+    return;
+  }
+
+  var html = '';
+
+  if (messages.length === 1) {
+    var m = messages[0];
+    var bytes = m.bytes;
+    var apci = parseAPCI(bytes);
+    var asdu = parseASDU(bytes);
+    var lenCheck = validateLength(bytes);
+    var diag = diagnoseContext(currentPort, apci.frameType, apci.ns, apci.nr, apci.uFuncType);
+    html = formatResult(bytes, apci, asdu, lenCheck, diag);
+
+    var summary = apci.frameType + '帧' + (apci.frameType === 'U' ? ' - ' + apci.uFuncName : '') +
+      (apci.frameType === 'I' ? ' N(S)=' + apci.ns + ' N(R)=' + apci.nr : '') +
+      (apci.frameType === 'S' ? ' N(R)=' + apci.nr : '') +
+      (asdu ? ' | ' + asdu.typeName : '');
+    addHistoryItem(m.rawHex, summary);
+  } else {
+    // 统计
+    var iCount = 0, sCount = 0, uCount = 0, warnCount = 0;
+    for (var k = 0; k < messages.length; k++) {
+      var a = parseAPCI(messages[k].bytes);
+      if (a.frameType === 'I') iCount++;
+      else if (a.frameType === 'S') sCount++;
+      else if (a.frameType === 'U') uCount++;
+    }
+    html += '<div class="card" style="border-left:4px solid #a29bfe">';
+    html += '<div class="card-title diag">批量解析结果</div>';
+    html += '<div class="field"><span class="field-label">报文总数</span><span class="field-value highlight">' + messages.length + ' 条</span></div>';
+    html += '<div class="field"><span class="field-label">I帧 / S帧 / U帧</span><span class="field-value">' + iCount + ' / ' + sCount + ' / ' + uCount + '</span></div>';
+    html += '<div class="field"><span class="field-label">时间范围</span><span class="field-value info">' + (messages[0].time || '-') + ' ~ ' + (messages[messages.length-1].time || '-') + '</span></div>';
+    html += '</div>';
+
+    for (var i = 0; i < messages.length; i++) {
+      html += renderOneMessage(messages[i], i + 1);
+    }
+
+    var hexBrief = messages.length + '条报文（' + (messages[0].time || '') + ' ~ ' + (messages[messages.length-1].time || '') + '）';
+    addHistoryItem(input.trim().substring(0, 60) + (input.length > 60 ? '...' : ''), hexBrief);
+  }
+
   document.getElementById('resultSection').innerHTML = html;
-
-  // 添加历史
-  var hexStr = input.trim();
-  var summary = apci.frameType + '帧' + (apci.frameType === 'U' ? ' - ' + apci.uFuncName : '') +
-    (apci.frameType === 'I' ? ' N(S)=' + apci.ns + ' N(R)=' + apci.nr : '') +
-    (apci.frameType === 'S' ? ' N(R)=' + apci.nr : '') +
-    (asdu ? ' | ' + asdu.typeName : '');
-  addHistoryItem(hexStr, summary);
-
-  // 更新端口状态
   updatePortStatus();
 }
 
@@ -1184,7 +1276,8 @@ var EXAMPLES = {
   'sframe':           '68 04 01 00 02 00',
   'iframe_msp':       '68 10 00 00 02 00 01 06 03 00 01 00 01 00 00 00 00',
   'iframe_float':     '68 14 02 00 04 00 0D 01 03 00 01 00 01 40 00 00 00 00 00 42 C8',
-  'interrogation':    '68 0E 00 00 00 00 64 01 06 00 01 00 00 00 00 00'
+  'interrogation':    '68 0E 00 00 00 00 64 01 06 00 01 00 00 00 00 00',
+  'multi_log': 'R00:02:27   68 12 C6 5C 70 06 0D 01 03 00 3F 06 46 40 00 7E 6A 74 42 00\nS00:02:27   68 04 01 00 C8 5C\nR00:02:28   68 12 C8 5C 70 06 0D 01 03 00 3F 06 44 40 00 CC A1 71 42 00\nS00:02:38   68 04 01 00 CA 5C\nR00:02:38   68 12 CA 5C 70 06 0D 01 03 00 3F 06 45 40 00 4C 37 7F 42 00\nR00:02:39   68 12 CC 5C 70 06 0D 01 03 00 3F 06 39 40 00 81 95 4D 42 00\nR00:02:45   68 12 CE 5C 70 06 0D 01 03 00 3F 06 3B 40 00 2D B2 49 42 00'
 };
 
 function loadExample(key) {
