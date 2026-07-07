@@ -302,6 +302,50 @@ body {
 .field-value.warn { color: #e94560; }
 .field-value.info { color: #00d2ff; }
 
+/* 信息对象列表 */
+.info-objects-section {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed #0f3460;
+}
+.info-objects-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #ffd166;
+  margin-bottom: 6px;
+}
+.info-object-item {
+  background: #0f346044;
+  border-radius: 4px;
+  padding: 5px 8px;
+  margin-bottom: 4px;
+  font-size: 13px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.io-index {
+  color: #00d2ff;
+  font-weight: 700;
+  background: #0f346088;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.io-ioa {
+  color: #a0a0c0;
+  font-family: monospace;
+}
+.io-value {
+  color: #00ff88;
+  font-weight: 700;
+  margin-left: auto;
+}
+.io-qu {
+  color: #a29bfe;
+  font-size: 12px;
+}
+
 /* 长度校验标签 */
 .len-ok {
   display: inline-block;
@@ -501,6 +545,48 @@ var TYPE_ID_MAP = {
   122: '文件节调用 (F_SC_NA)',
   123: '文件节结束 (F_LS_NA)',
   124: '文件调用 (F_FA_NA)'
+};
+
+/* TYPE ID 分类映射：遥测、遥信、遥控、遥调、总招等 */
+var TYPE_CATEGORY_MAP = {
+  1:   '遥信',
+  2:   '遥信',
+  3:   '遥信',
+  4:   '遥信',
+  5:   '遥信',
+  7:   '遥信',
+  9:   '遥测',
+  10:  '遥测',
+  11:  '遥测',
+  12:  '遥测',
+  13:  '遥测',
+  14:  '遥测',
+  15:  '遥测',
+  20:  '遥信',
+  21:  '遥信',
+  30:  '遥信',
+  31:  '遥信',
+  34:  '遥信',
+  45:  '遥控',
+  46:  '遥控',
+  47:  '遥控',
+  48:  '遥调',
+  49:  '遥调',
+  50:  '遥调',
+  58:  '遥控',
+  59:  '遥控',
+  70:  '遥脉',
+  100: '总招',
+  101: '遥脉',
+  102: '参数',
+  103: '时钟同步',
+  104: '参数',
+  105: '系统',
+  120: '文件',
+  121: '文件',
+  122: '文件',
+  123: '文件',
+  124: '文件'
 };
 
 /* COT 传送原因映射 */
@@ -723,6 +809,7 @@ function parseASDU(bytes) {
   var result = {
     typeId: bytes[6],
     typeName: '',
+    typeCategory: '',
     vsq: bytes[7],
     infoObjCount: bytes[7] & 0x7F,
     sq: (bytes[7] & 0x80) !== 0,
@@ -735,6 +822,7 @@ function parseASDU(bytes) {
     timestamp: null,
     timestampStr: '',
     hasTimestamp: false,
+    infoObjects: [],
     rawAsdu: []
   };
 
@@ -746,6 +834,7 @@ function parseASDU(bytes) {
   }
 
   result.typeName = TYPE_ID_MAP[result.typeId] || ('未知类型 (0x' + result.typeId.toString(16).toUpperCase() + ')');
+  result.typeCategory = getTypeCategory(result.typeId);
   result.cotName = COT_MAP[result.cot] || ('未知原因 (' + result.cot + ')');
 
   // 信息对象地址(3字节)：偏移12-14
@@ -768,6 +857,11 @@ function parseASDU(bytes) {
       result.timestamp = ts;
       result.timestampStr = ts.str;
     }
+  }
+
+  // 解析信息对象列表
+  if (bytes.length > 14 && result.infoObjCount > 0) {
+    result.infoObjects = parseInformationObjects(bytes, result);
   }
 
   // 记录原始ASDU字节
@@ -834,6 +928,299 @@ function validateLength(bytes) {
     actualLength: actualLength,
     ok: lengthField === actualLength
   };
+}
+
+/**
+ * parseFloat32 - 解析 IEEE 754 单精度浮点数（4字节，小端）
+ */
+function parseFloat32(bytes, offset) {
+  var buf = new ArrayBuffer(4);
+  var view = new DataView(buf);
+  for (var i = 0; i < 4; i++) {
+    view.setUint8(i, bytes[offset + i] || 0);
+  }
+  return view.getFloat32(0, true);
+}
+
+/**
+ * parseNormalizedValue - 解析归一化值（2字节，有符号，小端）
+ * 归一化值 = 原始值 / 32768
+ */
+function parseNormalizedValue(bytes, offset) {
+  var low = bytes[offset] || 0;
+  var high = bytes[offset + 1] || 0;
+  var raw = low | (high << 8);
+  if (raw & 0x8000) raw = raw - 0x10000;
+  return raw / 32768;
+}
+
+/**
+ * parseScaledValue - 解析标度化值（2字节，有符号整数，小端）
+ */
+function parseScaledValue(bytes, offset) {
+  var low = bytes[offset] || 0;
+  var high = bytes[offset + 1] || 0;
+  var raw = low | (high << 8);
+  if (raw & 0x8000) raw = raw - 0x10000;
+  return raw;
+}
+
+/**
+ * parseSinglePoint - 解析单点信息（1字节，bit0为状态值）
+ * 返回: { state: 0/1, quality: {}, iv: bool, nt: bool, sb: bool, bl: bool }
+ */
+function parseSinglePoint(byteVal) {
+  return {
+    state: byteVal & 0x01,
+    iv: (byteVal & 0x80) !== 0,
+    nt: (byteVal & 0x40) !== 0,
+    sb: (byteVal & 0x20) !== 0,
+    bl: (byteVal & 0x10) !== 0
+  };
+}
+
+/**
+ * parseDoublePoint - 解析双点信息（1字节，bit0-1为状态值）
+ * 0=不确定, 1=断开, 2=闭合, 3=不确定
+ */
+function parseDoublePoint(byteVal) {
+  var state = byteVal & 0x03;
+  var stateStr = ['不确定/中间态', '断开', '闭合', '不确定/故障'][state];
+  return {
+    state: state,
+    stateStr: stateStr,
+    iv: (byteVal & 0x80) !== 0,
+    nt: (byteVal & 0x40) !== 0,
+    sb: (byteVal & 0x20) !== 0,
+    bl: (byteVal & 0x10) !== 0
+  };
+}
+
+/**
+ * parseStepPosition - 解析步位置信息（状态1字节 + 步位置1字节）
+ */
+function parseStepPosition(bytes, offset) {
+  var stateByte = bytes[offset] || 0;
+  var stepByte = bytes[offset + 1] || 0;
+  var step = stepByte & 0x3F;
+  if (stepByte & 0x20) step = step - 64;
+  return {
+    state: stateByte & 0x01,
+    step: step,
+    iv: (stateByte & 0x80) !== 0,
+    nt: (stateByte & 0x40) !== 0,
+    sb: (stateByte & 0x20) !== 0,
+    bl: (stateByte & 0x10) !== 0
+  };
+}
+
+/**
+ * parseSingleCommand - 解析单点命令（1字节）
+ */
+function parseSingleCommand(byteVal) {
+  return {
+    state: byteVal & 0x01,
+    stateStr: (byteVal & 0x01) ? '合' : '分',
+    qu: (byteVal >> 2) & 0x07,
+    quStr: ['无定义', '脉冲', '持续', '无定义'][ (byteVal >> 2) & 0x03 ] || '无定义',
+    se: (byteVal & 0x80) !== 0
+  };
+}
+
+/**
+ * parseDoubleCommand - 解析双点命令（1字节）
+ */
+function parseDoubleCommand(byteVal) {
+  var dcs = byteVal & 0x03;
+  var dcsStr = ['不允许', '断开', '闭合', '不允许'][dcs] || '不允许';
+  return {
+    dcs: dcs,
+    dcsStr: dcsStr,
+    qu: (byteVal >> 2) & 0x07,
+    quStr: ['无定义', '脉冲', '持续', '无定义'][ (byteVal >> 2) & 0x03 ] || '无定义',
+    se: (byteVal & 0x80) !== 0
+  };
+}
+
+/**
+ * parseInformationObjects - 解析信息对象列表
+ * @param {number[]} bytes - 完整报文字节数组
+ * @param {object} asdu - ASDU解析结果
+ * @returns {object[]} 信息对象数组
+ */
+function parseInformationObjects(bytes, asdu) {
+  var typeId = asdu.typeId;
+  var sq = asdu.sq;
+  var count = asdu.infoObjCount;
+  var hasTimestamp = asdu.hasTimestamp;
+  var infoObjects = [];
+
+  if (count <= 0) return infoObjects;
+
+  var infoSize = getInfoElementSize(typeId);
+  var i, offset, ioa, obj;
+
+  if (!sq) {
+    var ioaOffset = 12;
+    for (i = 0; i < count; i++) {
+      if (bytes.length <= ioaOffset + 2) break;
+
+      ioa = bytes[ioaOffset] | (bytes[ioaOffset + 1] << 8) | (bytes[ioaOffset + 2] << 16);
+      var infoOffset = ioaOffset + 3;
+
+      obj = { index: i + 1, ioa: ioa, ioaHex: '0x' + ioa.toString(16).toUpperCase() };
+
+      if (bytes.length >= infoOffset + infoSize) {
+        parseInfoElement(typeId, bytes, infoOffset, obj);
+      }
+
+      infoObjects.push(obj);
+      ioaOffset = infoOffset + infoSize;
+    }
+  } else {
+    if (bytes.length <= 17) return infoObjects;
+    ioa = bytes[12] | (bytes[13] << 8) | (bytes[14] << 16);
+    offset = 15;
+
+    for (i = 0; i < count; i++) {
+      obj = { index: i + 1, ioa: ioa + i, ioaHex: '0x' + (ioa + i).toString(16).toUpperCase() };
+      if (bytes.length >= offset + infoSize) {
+        parseInfoElement(typeId, bytes, offset, obj);
+      }
+      infoObjects.push(obj);
+      offset += infoSize;
+    }
+  }
+
+  return infoObjects;
+}
+
+/**
+ * getInfoElementSize - 获取单个信息元素的字节大小
+ */
+function getInfoElementSize(typeId) {
+  switch (typeId) {
+    case 1: case 2: case 20: case 30:
+      return 1;
+    case 3: case 4: case 21: case 31:
+      return 1;
+    case 5: case 7: case 34:
+      return 2;
+    case 9: case 10:
+      return 2;
+    case 11: case 12:
+      return 2;
+    case 13: case 14:
+      return 4;
+    case 15:
+      return 2;
+    case 45: case 58:
+      return 1;
+    case 46: case 59:
+      return 1;
+    case 47:
+      return 1;
+    case 48:
+      return 2;
+    case 49:
+      return 2;
+    case 50:
+      return 4;
+    default:
+      return 1;
+  }
+}
+
+/**
+ * parseInfoElement - 解析单个信息元素，将结果写入 obj
+ */
+function parseInfoElement(typeId, bytes, offset, obj) {
+  switch (typeId) {
+    case 1: case 2: case 20: case 30:
+      var sp = parseSinglePoint(bytes[offset]);
+      obj.value = sp.state;
+      obj.valueStr = sp.state ? '合/1' : '分/0';
+      obj.quality = sp;
+      break;
+    case 3: case 4: case 21: case 31:
+      var dp = parseDoublePoint(bytes[offset]);
+      obj.value = dp.state;
+      obj.valueStr = dp.stateStr;
+      obj.quality = dp;
+      break;
+    case 5: case 7: case 34:
+      var st = parseStepPosition(bytes, offset);
+      obj.value = st.step;
+      obj.valueStr = '第 ' + st.step + ' 步';
+      obj.quality = st;
+      break;
+    case 9: case 10:
+      var nv = parseNormalizedValue(bytes, offset);
+      obj.value = nv;
+      obj.valueStr = nv.toFixed(6);
+      break;
+    case 11: case 12:
+      var sv = parseScaledValue(bytes, offset);
+      obj.value = sv;
+      obj.valueStr = sv.toString();
+      break;
+    case 13: case 14:
+      var fv = parseFloat32(bytes, offset);
+      obj.value = fv;
+      obj.valueStr = fv.toFixed(4);
+      break;
+    case 15:
+      var nv2 = parseNormalizedValue(bytes, offset);
+      obj.value = nv2;
+      obj.valueStr = nv2.toFixed(6);
+      break;
+    case 45: case 58:
+      var sc = parseSingleCommand(bytes[offset]);
+      obj.value = sc.state;
+      obj.valueStr = sc.stateStr;
+      obj.quStr = sc.quStr;
+      obj.se = sc.se;
+      break;
+    case 46: case 59:
+      var dc = parseDoubleCommand(bytes[offset]);
+      obj.value = dc.dcs;
+      obj.valueStr = dc.dcsStr;
+      obj.quStr = dc.quStr;
+      obj.se = dc.se;
+      break;
+    case 47:
+      var rcs = bytes[offset] & 0x07;
+      var rcsStr = ['不允许', '下降', '上升', '不允许', '不允许', '不允许', '不允许', '不允许'][rcs];
+      obj.value = rcs;
+      obj.valueStr = rcsStr;
+      break;
+    case 48:
+      var setNv = parseNormalizedValue(bytes, offset);
+      obj.value = setNv;
+      obj.valueStr = setNv.toFixed(6);
+      break;
+    case 49:
+      var setSv = parseScaledValue(bytes, offset);
+      obj.value = setSv;
+      obj.valueStr = setSv.toString();
+      break;
+    case 50:
+      var setFv = parseFloat32(bytes, offset);
+      obj.value = setFv;
+      obj.valueStr = setFv.toFixed(4);
+      break;
+    default:
+      obj.value = bytes[offset];
+      obj.valueStr = '0x' + bytes[offset].toString(16).toUpperCase();
+      break;
+  }
+}
+
+/**
+ * getTypeCategory - 获取类型分类
+ */
+function getTypeCategory(typeId) {
+  return TYPE_CATEGORY_MAP[typeId] || '其他';
 }
 
 /**
@@ -976,6 +1363,7 @@ function formatResult(bytes, apci, asdu, lenCheck, diag) {
     html += '<div class="card">';
     html += '<div class="card-title asdu">ASDU 层</div>';
     html += '<div class="field"><span class="field-label">类型标识 (TYPE ID)</span><span class="field-value highlight">' + asdu.typeId + ' - ' + asdu.typeName + '</span></div>';
+    html += '<div class="field"><span class="field-label">类型分类</span><span class="field-value" style="color:#ffd166;font-weight:700">' + asdu.typeCategory + '</span></div>';
     html += '<div class="field"><span class="field-label">VSQ</span><span class="field-value">0x' + asdu.vsq.toString(16).toUpperCase().padStart(2,'0') + '</span></div>';
     html += '<div class="field"><span class="field-label">信息体个数</span><span class="field-value info">' + asdu.infoObjCount + '</span></div>';
     html += '<div class="field"><span class="field-label">传输方式</span><span class="field-value">' + (asdu.sq ? '顺序传输 (SQ=1)' : '非顺序传输 (SQ=0)') + '</span></div>';
@@ -987,6 +1375,29 @@ function formatResult(bytes, apci, asdu, lenCheck, diag) {
     }
     if (asdu.timestampStr) {
       html += '<div class="field"><span class="field-label">时标 (CP56Time2a)</span><span class="field-value highlight">' + asdu.timestampStr + '</span></div>';
+    }
+
+    // 信息对象列表
+    if (asdu.infoObjects && asdu.infoObjects.length > 0) {
+      html += '<div class="info-objects-section">';
+      html += '<div class="info-objects-title">' + asdu.typeCategory + '点位明细（共 ' + asdu.infoObjects.length + ' 个）</div>';
+      for (var k = 0; k < asdu.infoObjects.length; k++) {
+        var io = asdu.infoObjects[k];
+        html += '<div class="info-object-item">';
+        html += '<span class="io-index">第 ' + io.index + ' 位</span>';
+        html += '<span class="io-ioa">IOA: ' + io.ioa + ' (' + io.ioaHex + ')</span>';
+        if (io.valueStr !== undefined) {
+          html += '<span class="io-value">' + io.valueStr + '</span>';
+        }
+        if (io.quality && io.quality.iv) {
+          html += '<span class="io-quality" style="color:#e94560">[无效]</span>';
+        }
+        if (io.quStr) {
+          html += '<span class="io-qu">[' + io.quStr + ']</span>';
+        }
+        html += '</div>';
+      }
+      html += '</div>';
     }
 
     // 显示ASDU原始字节
@@ -1090,6 +1501,7 @@ function formatResultInner(bytes, apci, asdu, lenCheck, diag) {
   if (asdu) {
     html += '<div style="margin-top:6px;padding-top:4px;border-top:1px dashed #0f346066"></div>';
     html += '<div class="field"><span class="field-label">类型标识 (TYPE ID)</span><span class="field-value highlight">' + asdu.typeId + ' - ' + asdu.typeName + '</span></div>';
+    html += '<div class="field"><span class="field-label">类型分类</span><span class="field-value" style="color:#ffd166;font-weight:700">' + asdu.typeCategory + '</span></div>';
     html += '<div class="field"><span class="field-label">VSQ</span><span class="field-value">0x' + asdu.vsq.toString(16).toUpperCase().padStart(2,'0') + '</span></div>';
     html += '<div class="field"><span class="field-label">信息体个数</span><span class="field-value info">' + asdu.infoObjCount + '</span></div>';
     html += '<div class="field"><span class="field-label">传输方式</span><span class="field-value">' + (asdu.sq ? '顺序传输 (SQ=1)' : '非顺序传输 (SQ=0)') + '</span></div>';
@@ -1101,6 +1513,29 @@ function formatResultInner(bytes, apci, asdu, lenCheck, diag) {
     }
     if (asdu.timestampStr) {
       html += '<div class="field"><span class="field-label">时标 (CP56Time2a)</span><span class="field-value highlight">' + asdu.timestampStr + '</span></div>';
+    }
+
+    // 信息对象列表
+    if (asdu.infoObjects && asdu.infoObjects.length > 0) {
+      html += '<div class="info-objects-section">';
+      html += '<div class="info-objects-title">' + asdu.typeCategory + '点位明细（共 ' + asdu.infoObjects.length + ' 个）</div>';
+      for (var k = 0; k < asdu.infoObjects.length; k++) {
+        var io = asdu.infoObjects[k];
+        html += '<div class="info-object-item">';
+        html += '<span class="io-index">第 ' + io.index + ' 位</span>';
+        html += '<span class="io-ioa">IOA: ' + io.ioa + ' (' + io.ioaHex + ')</span>';
+        if (io.valueStr !== undefined) {
+          html += '<span class="io-value">' + io.valueStr + '</span>';
+        }
+        if (io.quality && io.quality.iv) {
+          html += '<span class="io-quality" style="color:#e94560">[无效]</span>';
+        }
+        if (io.quStr) {
+          html += '<span class="io-qu">[' + io.quStr + ']</span>';
+        }
+        html += '</div>';
+      }
+      html += '</div>';
     }
     html += '<div class="field"><span class="field-label">ASDU原始</span><span class="field-value" style="font-family:monospace;font-size:12px;word-break:break-all">' +
       asdu.rawAsdu.map(function(b){ return b.toString(16).toUpperCase().padStart(2,'0'); }).join(' ') + '</span></div>';
