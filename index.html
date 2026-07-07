@@ -1,0 +1,1732 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<!--
+  ============================================================
+  IEC 104 报文粘贴解析与诊断工具 (104-html-converter)
+  ============================================================
+  文件：index.html
+  说明：完全独立的单页HTML5文件，无任何外部CDN依赖。
+        用于IEC 104协议报文的粘贴解析、长度校验与上下文诊断。
+
+  函数清单：
+  ────────────────────────────────────────────────────────────
+  parseHexInput(input)
+    将用户粘贴的十六进制字符串转为字节数组，支持空格/逗号/换行分隔。
+
+  parseAPCI(bytes)
+    解析APCI层：启动字符、APDU长度、控制域，判断帧类型(I/S/U)。
+
+  parseControlField(bytes)
+    拆解控制域4字节，返回帧类型及N(S)/N(R)或U帧功能码。
+
+  parseASDU(bytes)
+    解析ASDU层：类型标识(TYPE ID)、VSQ、COT、公共地址、
+    信息对象地址(IOA)、时标(CP56Time2a)等。
+
+  getTypeName(typeId)
+    TYPE ID → 中文全称映射。
+
+  getCOTName(cot)
+    传送原因(COT) → 中文映射。
+
+  parseCP56Time2a(bytes, offset)
+    解析CP56Time2a时标为可读日期时间字符串。
+
+  validateLength(bytes)
+    长度校验：比较Length字段与实际APDU长度。
+
+  diagnoseContext(port, frameType, ns, nr, uFunc)
+    多端口上下文诊断：检查序列号跳变、S帧确认号异常、U帧配对。
+
+  formatResult(result)
+    将解析结果格式化为HTML卡片输出。
+
+  onParse()
+    主解析入口：读取输入、调度解析、输出结果。
+
+  addPort(portNum)
+    添加新端口上下文。
+
+  removePort(portNum)
+    删除端口上下文。
+
+  switchPort(portNum)
+    切换当前活跃端口。
+
+  ────────────────────────────────────────────────────────────
+-->
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+<title>IEC 104 报文解析与诊断工具</title>
+<style>
+/* ===== 全局重置与基础 ===== */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { font-size: 16px; -webkit-text-size-adjust: 100%; }
+body {
+  font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC",
+    "Hiragino Sans GB", "Microsoft YaHei", sans-serif;
+  background: #1a1a2e;
+  color: #e0e0e0;
+  line-height: 1.6;
+  min-height: 100vh;
+  overflow-x: hidden;
+}
+
+/* ===== 顶部粘性工具栏 ===== */
+.toolbar {
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  background: #16213e;
+  border-bottom: 2px solid #0f3460;
+  padding: 10px 12px 8px;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.5);
+}
+.toolbar-title {
+  font-size: 18px;
+  font-weight: 700;
+  color: #00d2ff;
+  text-align: center;
+  margin-bottom: 8px;
+  letter-spacing: 1px;
+}
+.toolbar-row {
+  display: flex;
+  gap: 8px;
+  align-items: center;
+  flex-wrap: wrap;
+}
+.port-group {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  flex-shrink: 0;
+}
+.port-group label {
+  font-size: 14px;
+  color: #a0a0c0;
+  white-space: nowrap;
+}
+.port-select {
+  background: #0f3460;
+  color: #00d2ff;
+  border: 1px solid #00d2ff;
+  border-radius: 6px;
+  padding: 6px 10px;
+  font-size: 15px;
+  min-height: 44px;
+  min-width: 90px;
+  outline: none;
+  cursor: pointer;
+}
+.port-select:focus { border-color: #e94560; }
+
+.port-manage-btns {
+  display: flex;
+  gap: 4px;
+}
+.btn-sm {
+  background: #0f3460;
+  color: #00d2ff;
+  border: 1px solid #00d2ff44;
+  border-radius: 6px;
+  min-width: 36px;
+  min-height: 44px;
+  font-size: 20px;
+  cursor: pointer;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  transition: background .15s;
+}
+.btn-sm:active { background: #e94560; color: #fff; }
+
+.btn-parse {
+  background: linear-gradient(135deg, #e94560, #c62a4a);
+  color: #fff;
+  border: none;
+  border-radius: 8px;
+  padding: 0 20px;
+  min-height: 44px;
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  letter-spacing: 2px;
+  flex-shrink: 0;
+  transition: transform .1s;
+}
+.btn-parse:active { transform: scale(0.96); }
+
+.btn-clear {
+  background: #333;
+  color: #aaa;
+  border: 1px solid #555;
+  border-radius: 8px;
+  padding: 0 14px;
+  min-height: 44px;
+  font-size: 15px;
+  cursor: pointer;
+  flex-shrink: 0;
+}
+
+/* ===== 主内容区 ===== */
+.main-content {
+  padding: 10px 12px 40px;
+  max-width: 800px;
+  margin: 0 auto;
+}
+
+/* ===== 输入区 ===== */
+.input-section {
+  margin-bottom: 12px;
+}
+.input-section label {
+  display: block;
+  font-size: 14px;
+  color: #a0a0c0;
+  margin-bottom: 4px;
+}
+.hex-input {
+  width: 100%;
+  min-height: 80px;
+  background: #16213e;
+  color: #00ff88;
+  border: 2px solid #0f3460;
+  border-radius: 8px;
+  padding: 10px 12px;
+  font-size: 15px;
+  font-family: "Courier New", Courier, monospace;
+  resize: vertical;
+  outline: none;
+  line-height: 1.5;
+}
+.hex-input::placeholder { color: #555; }
+.hex-input:focus { border-color: #e94560; }
+
+/* ===== 示例按钮行 ===== */
+.example-row {
+  margin: 6px 0 10px;
+  display: flex;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.btn-example {
+  background: #0f3460;
+  color: #a0d0ff;
+  border: 1px solid #0f346088;
+  border-radius: 6px;
+  padding: 4px 10px;
+  min-height: 36px;
+  font-size: 13px;
+  cursor: pointer;
+  transition: background .15s;
+}
+.btn-example:active { background: #e94560; color: #fff; }
+
+/* ===== 端口状态面板 ===== */
+.port-status {
+  background: #16213e;
+  border: 1px solid #0f3460;
+  border-radius: 8px;
+  padding: 8px 12px;
+  margin-bottom: 12px;
+  font-size: 13px;
+  color: #80a0c0;
+  line-height: 1.7;
+}
+.port-status-title {
+  font-weight: 700;
+  color: #00d2ff;
+  font-size: 14px;
+  margin-bottom: 4px;
+}
+.port-status-item {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+}
+.port-status-item span { margin-right: 12px; }
+
+/* ===== 结果区 ===== */
+.result-section {
+  margin-top: 8px;
+}
+.result-section h3 {
+  font-size: 15px;
+  color: #00d2ff;
+  margin-bottom: 6px;
+}
+
+/* ===== 解析卡片 ===== */
+.card {
+  background: #16213e;
+  border: 1px solid #0f3460;
+  border-radius: 10px;
+  padding: 12px 14px;
+  margin-bottom: 10px;
+  box-shadow: 0 2px 8px rgba(0,0,0,0.3);
+}
+.card-title {
+  font-size: 16px;
+  font-weight: 700;
+  margin-bottom: 8px;
+  padding-bottom: 4px;
+  border-bottom: 1px solid #0f346066;
+}
+.card-title.apci { color: #00d2ff; }
+.card-title.asdu { color: #ff9f43; }
+.card-title.diag { color: #a29bfe; }
+
+.field {
+  display: flex;
+  justify-content: space-between;
+  align-items: baseline;
+  padding: 3px 0;
+  flex-wrap: wrap;
+  gap: 4px;
+}
+.field-label {
+  color: #8888aa;
+  font-size: 14px;
+  flex-shrink: 0;
+}
+.field-value {
+  color: #e0e0e0;
+  font-size: 15px;
+  font-weight: 600;
+  text-align: right;
+  word-break: break-all;
+}
+.field-value.highlight { color: #00ff88; font-size: 17px; }
+.field-value.warn { color: #e94560; }
+.field-value.info { color: #00d2ff; }
+
+/* 信息对象列表 */
+.info-objects-section {
+  margin-top: 10px;
+  padding-top: 10px;
+  border-top: 1px dashed #0f3460;
+}
+.info-objects-title {
+  font-size: 14px;
+  font-weight: 700;
+  color: #ffd166;
+  margin-bottom: 6px;
+}
+.info-object-item {
+  background: #0f346044;
+  border-radius: 4px;
+  padding: 5px 8px;
+  margin-bottom: 4px;
+  font-size: 13px;
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  align-items: center;
+}
+.io-index {
+  color: #00d2ff;
+  font-weight: 700;
+  background: #0f346088;
+  padding: 1px 6px;
+  border-radius: 3px;
+}
+.io-ioa {
+  color: #a0a0c0;
+  font-family: monospace;
+}
+.io-value {
+  color: #00ff88;
+  font-weight: 700;
+  margin-left: auto;
+}
+.io-qu {
+  color: #a29bfe;
+  font-size: 12px;
+}
+
+/* 长度校验标签 */
+.len-ok {
+  display: inline-block;
+  background: #00c85322;
+  color: #00ff88;
+  padding: 2px 10px;
+  border-radius: 4px;
+  font-size: 14px;
+  font-weight: 700;
+  margin-top: 4px;
+}
+.len-fail {
+  display: block;
+  background: #e9456033;
+  color: #ff6b6b;
+  padding: 6px 12px;
+  border-radius: 6px;
+  font-size: 15px;
+  font-weight: 700;
+  margin-top: 6px;
+  border: 1px solid #e9456066;
+}
+
+/* 诊断标签 */
+.diag-ok {
+  background: #00c85322;
+  color: #00ff88;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 14px;
+}
+.diag-warn {
+  background: #e9456033;
+  color: #ff6b6b;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 14px;
+  border: 1px solid #e9456044;
+}
+.diag-info {
+  background: #0f346088;
+  color: #00d2ff;
+  padding: 4px 10px;
+  border-radius: 4px;
+  font-size: 14px;
+}
+
+/* ===== 历史记录 ===== */
+.history-section { margin-top: 14px; }
+.history-section h3 {
+  font-size: 15px;
+  color: #a29bfe;
+  margin-bottom: 6px;
+}
+.history-item {
+  background: #16213ecc;
+  border: 1px solid #0f346066;
+  border-radius: 6px;
+  padding: 6px 10px;
+  margin-bottom: 6px;
+  font-size: 13px;
+  color: #a0a0c0;
+  cursor: pointer;
+  transition: background .15s;
+}
+.history-item:active { background: #0f3460; }
+.history-item .hi-port { color: #00d2ff; font-weight: 700; }
+.history-item .hi-hex { color: #00ff88; font-family: monospace; }
+.history-item .hi-summary { color: #e0e0e0; }
+
+/* ===== 底部信息 ===== */
+.footer {
+  text-align: center;
+  color: #555;
+  font-size: 12px;
+  padding: 20px 0 10px;
+}
+
+/* ===== 滚动条美化 ===== */
+::-webkit-scrollbar { width: 6px; }
+::-webkit-scrollbar-track { background: #1a1a2e; }
+::-webkit-scrollbar-thumb { background: #0f3460; border-radius: 3px; }
+</style>
+</head>
+<body>
+
+<!-- 顶部粘性工具栏 -->
+<div class="toolbar">
+  <div class="toolbar-title">IEC 104 报文解析与诊断工具</div>
+  <div class="toolbar-row">
+    <div class="port-group">
+      <label>端口</label>
+      <select id="portSelect" class="port-select" onchange="switchPort(this.value)">
+        <option value="2404">2404</option>
+      </select>
+      <div class="port-manage-btns">
+        <button class="btn-sm" onclick="addPort()" title="添加端口">+</button>
+        <button class="btn-sm" onclick="removePort()" title="删除当前端口">&minus;</button>
+      </div>
+    </div>
+    <button class="btn-parse" onclick="onParse()">解 析</button>
+    <button class="btn-clear" onclick="onClear()">清空</button>
+  </div>
+</div>
+
+<!-- 主内容区 -->
+<div class="main-content">
+
+  <!-- 输入区 -->
+  <div class="input-section">
+    <label for="hexInput">粘贴十六进制报文（空格/逗号/换行分隔均可）：</label>
+    <textarea id="hexInput" class="hex-input" placeholder="例如：68 04 43 00 00 00&#10;或：68,0E,00,00,00,01,06,01,00,01,00,01,00,00,00,00"></textarea>
+  </div>
+
+  <!-- 示例按钮 -->
+  <div class="example-row">
+    <button class="btn-example" onclick="loadExample('uframe_start')">U帧-STARTDT</button>
+    <button class="btn-example" onclick="loadExample('uframe_start_ack')">U帧-STARTDT确认</button>
+    <button class="btn-example" onclick="loadExample('sframe')">S帧</button>
+    <button class="btn-example" onclick="loadExample('iframe_msp')">I帧-单点</button>
+    <button class="btn-example" onclick="loadExample('iframe_float')">I帧-浮点</button>
+    <button class="btn-example" onclick="loadExample('interrogation')">总召唤</button>
+    <button class="btn-example" onclick="loadExample('multi_log')">批量日志</button>
+  </div>
+
+  <!-- 端口状态 -->
+  <div class="port-status" id="portStatus"></div>
+
+  <!-- 解析结果 -->
+  <div class="result-section" id="resultSection"></div>
+
+  <!-- 历史记录 -->
+  <div class="history-section" id="historySection"></div>
+</div>
+
+<div class="footer">IEC 104 Protocol Analyzer &mdash; 纯前端本地解析，无网络通信</div>
+
+<script>
+/* ==========================================================
+   全局状态
+   ========================================================== */
+
+/**
+ * portContexts 存储每个端口的上下文信息：
+ *   lastNS:      上次收到的I帧发送序列号 N(S)
+ *   lastNR:      上次收到的I帧接收序列号 N(R)
+ *   sFrameNR:    上次收到的S帧 N(R)
+ *   lastUFrame:  上次收到的U帧类型 (STARTDT_ACT, STARTDT_CON, STOPDT_ACT, STOPDT_CON, TESTFR_ACT, TESTFR_CON)
+ *   uPending:    是否有未确认的U帧
+ *   uPendingType:未确认的U帧类型
+ *   history:     该端口的解析历史
+ */
+var portContexts = {
+  2404: { lastNS: null, lastNR: null, sFrameNR: null, lastUFrame: null, uPending: false, uPendingType: null, history: [] }
+};
+var currentPort = 2404;
+
+/* ==========================================================
+   TYPE ID 中文映射表
+   ========================================================== */
+var TYPE_ID_MAP = {
+  1:   '单点信息 (M_SP_NA)',
+  2:   '带时标单点信息 (M_SP_TA)',
+  3:   '双点信息 (M_DP_NA)',
+  4:   '带时标双点信息 (M_DP_TA)',
+  5:   '步位置信息 (M_ST_NA)',
+  7:   '带时标步位置信息 (M_ST_TA)',
+  9:   '归一化值 (M_ME_NA)',
+  10:  '带时标归一化值 (M_ME_TA)',
+  11:  '标度化值 (M_ME_NB)',
+  12:  '带时标标度化值 (M_ME_TB)',
+  13:  '浮点值 (M_ME_NC)',
+  14:  '带时标浮点值 (M_ME_TC)',
+  15:  '归一化值(短浮点) (M_ME_ND)',
+  20:  '带变位时标的单点信息 (M_SP_TB)',
+  21:  '带变位时标的双点信息 (M_DP_TB)',
+  30:  '单点信息(SOE) (M_SP_TB)',
+  31:  '双点信息(SOE) (M_DP_TB)',
+  34:  '带变位时标的步位置信息 (M_ST_TB)',
+  45:  '单点命令 (C_SC_NA)',
+  46:  '双点命令 (C_DC_NA)',
+  47:  '升降命令 (C_RC_NA)',
+  48:  '设点命令归一化 (C_SE_NA)',
+  49:  '设点命令标度化 (C_SE_NB)',
+  50:  '设点命令短浮点 (C_SE_NC)',
+  58:  '带时标单点命令 (C_SC_TA)',
+  59:  '带时标双点命令 (C_DC_TA)',
+  70:  '电能脉冲召唤命令 (C_IC_NA)',
+  100: '总召唤 (C_IC_NA_100)',
+  101: '电能脉冲召唤 (C_CI_NA)',
+  102: '参数读取 (C_RD_NA)',
+  103: '时钟同步 (C_CS_NA)',
+  104: '参数激活 (C_TS_NA)',
+  105: '复位进程 (C_RP_NA)',
+  120: '文件准备就绪 (F_FR_NA)',
+  121: '文件节准备就绪 (F_SR_NA)',
+  122: '文件节调用 (F_SC_NA)',
+  123: '文件节结束 (F_LS_NA)',
+  124: '文件调用 (F_FA_NA)'
+};
+
+/* TYPE ID 分类映射：遥测、遥信、遥控、遥调、总招等 */
+var TYPE_CATEGORY_MAP = {
+  1:   '遥信',
+  2:   '遥信',
+  3:   '遥信',
+  4:   '遥信',
+  5:   '遥信',
+  7:   '遥信',
+  9:   '遥测',
+  10:  '遥测',
+  11:  '遥测',
+  12:  '遥测',
+  13:  '遥测',
+  14:  '遥测',
+  15:  '遥测',
+  20:  '遥信',
+  21:  '遥信',
+  30:  '遥信',
+  31:  '遥信',
+  34:  '遥信',
+  45:  '遥控',
+  46:  '遥控',
+  47:  '遥控',
+  48:  '遥调',
+  49:  '遥调',
+  50:  '遥调',
+  58:  '遥控',
+  59:  '遥控',
+  70:  '遥脉',
+  100: '总招',
+  101: '遥脉',
+  102: '参数',
+  103: '时钟同步',
+  104: '参数',
+  105: '系统',
+  120: '文件',
+  121: '文件',
+  122: '文件',
+  123: '文件',
+  124: '文件'
+};
+
+/* COT 传送原因映射 */
+var COT_MAP = {
+  1:  '周期/循环',
+  2:  '背景扫描',
+  3:  '突发(自发)',
+  4:  '初始化',
+  5:  '请求/被请求',
+  6:  '激活',
+  7:  '激活确认',
+  8:  '停止激活',
+  9:  '停止激活确认',
+  10: '总召唤',
+  11: '总召唤终止',
+  12: '当地命令',
+  13: '文件传输',
+  20: '响应站召唤',
+  21: '响应第1组召唤',
+  22: '响应第2组召唤',
+  37: '响应计数器总召唤',
+  44: '未知的类型标识',
+  45: '未知的传送原因',
+  46: '未知的应用服务数据单元公共地址',
+  47: '未知的信息对象地址'
+};
+
+/* U帧功能码映射（IEC 104控制域第1字节值） */
+var U_FUNC_MAP = {
+  0x07: 'STARTDT 激活',
+  0x0B: 'STARTDT 确认',
+  0x13: 'STOPDT 激活',
+  0x23: 'STOPDT 确认',
+  0x43: 'TESTFR 激活',
+  0x83: 'TESTFR 确认'
+};
+
+var U_FUNC_TYPE = {
+  0x07: 'STARTDT_ACT',
+  0x0B: 'STARTDT_CON',
+  0x13: 'STOPDT_ACT',
+  0x23: 'STOPDT_CON',
+  0x43: 'TESTFR_ACT',
+  0x83: 'TESTFR_CON'
+};
+
+/* U帧配对关系 */
+var U_PAIR = {
+  'STARTDT_ACT': 'STARTDT_CON',
+  'STOPDT_ACT': 'STOPDT_CON',
+  'TESTFR_ACT': 'TESTFR_CON'
+};
+var U_ACT_SET = { 'STARTDT_ACT': true, 'STOPDT_ACT': true, 'TESTFR_ACT': true };
+
+/* ==========================================================
+   解析函数
+   ========================================================== */
+
+/**
+ * parseHexInput - 将粘贴的十六进制字符串解析为字节数组
+ * @param {string} input - 支持空格/逗号/分号/换行分隔的十六进制字符串
+ * @returns {number[]} 字节数组，解析失败返回null
+ */
+function parseHexInput(input) {
+  if (!input || !input.trim()) return null;
+  // 替换所有分隔符为空格
+  var cleaned = input.replace(/[,;\s\n\r\t]+/g, ' ').trim();
+  if (!cleaned) return null;
+  var parts = cleaned.split(' ');
+  var bytes = [];
+  for (var i = 0; i < parts.length; i++) {
+    var p = parts[i].trim();
+    if (!p) continue;
+    // 移除0x前缀
+    if (p.indexOf('0x') === 0 || p.indexOf('0X') === 0) p = p.substring(2);
+    if (p.indexOf('h') === p.length - 1) p = p.substring(0, p.length - 1);
+    var val = parseInt(p, 16);
+    if (isNaN(val) || val < 0 || val > 255) return null;
+    bytes.push(val);
+  }
+  return bytes.length > 0 ? bytes : null;
+}
+
+/**
+ * parseMultiFrames - 从任意格式的文本中切割出多条IEC 104报文
+ * 自动忽略所有前缀（如R00:02:27、S00:02:27、时间戳、注释等），
+ * 仅以 0x68 启动字符 + 第2字节长度字段 为准切割完整报文。
+ * 支持：单条报文、多行带前缀报文、跨行续行报文、一行多条报文。
+ * @param {string} input - 任意格式的文本，内含十六进制报文
+ * @returns {object[]|null} 报文数组，每项 {dir, time, bytes, rawHex}
+ */
+function parseMultiFrames(input) {
+  if (!input || !input.trim()) return null;
+  var lines = input.split(/\r?\n/);
+  var allBytes = [];
+  var lineInfo = [];
+
+  for (var i = 0; i < lines.length; i++) {
+    var line = lines[i].trim();
+    if (!line) continue;
+
+    // 提取方向和时间（可选，用于显示）
+    var dir = '', time = '';
+    var m = line.match(/^([RSrsTt])\s*(\d{1,2}:\d{2}:\d{2}(?:\.\d+)?)?\s*(.*)$/);
+    if (m) {
+      dir = m[1].toUpperCase();
+      time = m[2] || '';
+      line = m[3];
+    }
+
+    // 解析该行的十六进制字节
+    var cleaned = line.replace(/[,;:\s]+/g, ' ').trim();
+    if (!cleaned) continue;
+    var parts = cleaned.split(' ');
+    for (var j = 0; j < parts.length; j++) {
+      var p = parts[j].trim();
+      if (!p) continue;
+      if (p.indexOf('0x') === 0 || p.indexOf('0X') === 0) p = p.substring(2);
+      if (p.length && p[p.length - 1] === 'h') p = p.substring(0, p.length - 1);
+      var val = parseInt(p, 16);
+      if (isNaN(val) || val < 0 || val > 255) continue;
+      allBytes.push(val);
+      lineInfo.push({ dir: dir, time: time });
+    }
+  }
+
+  if (allBytes.length < 6) return null;
+
+  // 按 0x68 + 长度字段 切割报文
+  var messages = [];
+  var idx = 0;
+  while (idx < allBytes.length) {
+    if (allBytes[idx] !== 0x68) { idx++; continue; }
+    if (idx + 1 >= allBytes.length) break;
+    var len = allBytes[idx + 1];
+    var total = len + 2;
+    if (total < 6 || total > 255 + 2 || idx + total > allBytes.length) {
+      idx++;
+      continue;
+    }
+    // 再验证一下：第6字节后如果还有ASDU，合理性检查（非必须，跳过）
+    var msgBytes = allBytes.slice(idx, idx + total);
+    var msgDir = lineInfo[idx] ? lineInfo[idx].dir : '';
+    var msgTime = lineInfo[idx] ? lineInfo[idx].time : '';
+    var hexStr = msgBytes.map(function(x){
+      return x.toString(16).toUpperCase().padStart(2,'0');
+    }).join(' ');
+    messages.push({ dir: msgDir, time: msgTime, bytes: msgBytes, rawHex: hexStr });
+    idx += total;
+  }
+
+  return messages.length > 0 ? messages : null;
+}
+
+/**
+ * parseAPCI - 解析APCI层
+ * @param {number[]} bytes - 报文字节数组
+ * @returns {object} APCI解析结果
+ */
+function parseAPCI(bytes) {
+  var result = {
+    startChar: bytes[0],
+    lengthField: bytes[1],
+    actualLength: bytes.length - 2,
+    lengthOk: bytes[1] === (bytes.length - 2),
+    controlField: [bytes[2], bytes[3], bytes[4], bytes[5]],
+    frameType: 'UNKNOWN',
+    ns: null,
+    nr: null,
+    uFunc: null,
+    uFuncName: '',
+    uFuncType: ''
+  };
+
+  // 判断帧类型
+  var byte1 = bytes[2];
+  if ((byte1 & 0x01) === 0) {
+    // I帧：bit0=0
+    result.frameType = 'I';
+    result.ns = ((bytes[2] & 0xFE) >> 1) | ((bytes[3] & 0xFF) << 7);
+    result.nr = ((bytes[4] & 0xFE) >> 1) | ((bytes[5] & 0xFF) << 7);
+  } else if ((byte1 & 0x03) === 0x01) {
+    // S帧：bit0=1, bit1=0
+    result.frameType = 'S';
+    result.nr = ((bytes[4] & 0xFE) >> 1) | ((bytes[5] & 0xFF) << 7);
+  } else if ((byte1 & 0x03) === 0x03) {
+    // U帧：bit0=1, bit1=1
+    result.frameType = 'U';
+    var funcCode = byte1;
+    result.uFunc = funcCode;
+    result.uFuncName = U_FUNC_MAP[funcCode] || ('未知(0x' + funcCode.toString(16).toUpperCase() + ')');
+    result.uFuncType = U_FUNC_TYPE[funcCode] || '';
+  }
+
+  return result;
+}
+
+/**
+ * parseASDU - 解析ASDU层（从字节6开始）
+ * @param {number[]} bytes - 报文字节数组
+ * @returns {object} ASDU解析结果
+ */
+function parseASDU(bytes) {
+  if (bytes.length <= 6) return null;
+
+  /*
+   * IEC 104 ASDU结构（从APDU字节6开始）：
+   *   偏移6:  TYPE ID (1字节)
+   *   偏移7:  VSQ (1字节)
+   *   偏移8:  COT低字节 (传送原因)
+   *   偏移9:  OA  (原地址/组织地址)
+   *   偏移10: CA低字节 (公共地址)
+   *   偏移11: CA高字节
+   *   偏移12: IOA低字节 (信息对象地址)
+   *   偏移13: IOA中字节
+   *   偏移14: IOA高字节
+   *   偏移15+: 信息体数据 + 时标
+   */
+
+  var result = {
+    typeId: bytes[6],
+    typeName: '',
+    typeCategory: '',
+    vsq: bytes[7],
+    infoObjCount: bytes[7] & 0x7F,
+    sq: (bytes[7] & 0x80) !== 0,
+    cot: bytes[8],
+    cotName: '',
+    oa: bytes.length > 9 ? bytes[9] : 0,
+    ca: 0,
+    ioa: null,
+    ioaHex: '',
+    timestamp: null,
+    timestampStr: '',
+    hasTimestamp: false,
+    infoObjects: [],
+    rawAsdu: []
+  };
+
+  // 公共地址(2字节): 偏移10-11
+  if (bytes.length > 11) {
+    var caLow  = bytes[10] || 0;
+    var caHigh = bytes[11] || 0;
+    result.ca = caLow | (caHigh << 8);
+  }
+
+  result.typeName = TYPE_ID_MAP[result.typeId] || ('未知类型 (0x' + result.typeId.toString(16).toUpperCase() + ')');
+  result.typeCategory = getTypeCategory(result.typeId);
+  result.cotName = COT_MAP[result.cot] || ('未知原因 (' + result.cot + ')');
+
+  // 信息对象地址(3字节)：偏移12-14
+  if (bytes.length > 14) {
+    var ioa1 = bytes[12] || 0;
+    var ioa2 = bytes[13] || 0;
+    var ioa3 = bytes[14] || 0;
+    result.ioa = ioa1 | (ioa2 << 8) | (ioa3 << 16);
+    result.ioaHex = '0x' + result.ioa.toString(16).toUpperCase();
+  }
+
+  // 判断是否带时标 - 简单规则：带时标的类型ID在映射表中含"时标"字样
+  result.hasTimestamp = result.typeName.indexOf('时标') !== -1 || result.typeName.indexOf('SOE') !== -1 || result.typeName.indexOf('变位时标') !== -1;
+
+  // 尝试解析CP56Time2a时标（在信息体末尾7字节）
+  if (result.hasTimestamp && bytes.length >= 22) {
+    var tsOffset = bytes.length - 7;
+    if (tsOffset >= 15) {
+      var ts = parseCP56Time2a(bytes, tsOffset);
+      result.timestamp = ts;
+      result.timestampStr = ts.str;
+    }
+  }
+
+  // 解析信息对象列表
+  if (bytes.length > 14 && result.infoObjCount > 0) {
+    result.infoObjects = parseInformationObjects(bytes, result);
+  }
+
+  // 记录原始ASDU字节
+  result.rawAsdu = bytes.slice(6);
+
+  return result;
+}
+
+/**
+ * parseCP56Time2a - 解析CP56Time2a时标
+ * @param {number[]} bytes - 字节数组
+ * @param {number} offset - 起始偏移
+ * @returns {object} 时标解析结果
+ */
+function parseCP56Time2a(bytes, offset) {
+  var ms = bytes[offset] | (bytes[offset + 1] << 8);
+  var second = Math.floor(ms / 1000);
+  var millisec = ms % 1000;
+  var minute = bytes[offset + 2] & 0x3F;
+  var hour   = bytes[offset + 3] & 0x1F;
+  var day    = bytes[offset + 4] & 0x1F;
+  var month  = bytes[offset + 5] & 0x0F;
+  var yearLo = bytes[offset + 6] & 0x7F;
+  var year   = 2000 + yearLo;
+  var iv = (bytes[offset + 2] & 0x80) ? '无效' : '有效';
+  var su = (bytes[offset + 3] & 0x80) ? '夏令时' : '标准时间';
+
+  var str = year + '-' + pad2(month) + '-' + pad2(day) + ' ' +
+            pad2(hour) + ':' + pad2(minute) + ':' + pad2(second) + '.' + pad3(millisec) +
+            ' (' + iv + ', ' + su + ')';
+
+  return {
+    year: year, month: month, day: day,
+    hour: hour, minute: minute, second: second, millisec: millisec,
+    iv: iv, su: su, str: str
+  };
+}
+
+function pad2(n) { return n < 10 ? '0' + n : '' + n; }
+function pad3(n) { return n < 10 ? '00' + n : (n < 100 ? '0' + n : '' + n); }
+
+/**
+ * getTypeName - 获取TYPE ID的中文名称
+ */
+function getTypeName(typeId) {
+  return TYPE_ID_MAP[typeId] || ('未知类型 (0x' + typeId.toString(16).toUpperCase() + ')');
+}
+
+/**
+ * getCOTName - 获取COT的中文名称
+ */
+function getCOTName(cot) {
+  return COT_MAP[cot] || ('未知原因 (' + cot + ')');
+}
+
+/**
+ * validateLength - 长度校验
+ */
+function validateLength(bytes) {
+  var lengthField = bytes[1];
+  var actualLength = bytes.length - 2;
+  return {
+    lengthField: lengthField,
+    actualLength: actualLength,
+    ok: lengthField === actualLength
+  };
+}
+
+/**
+ * parseFloat32 - 解析 IEEE 754 单精度浮点数（4字节，小端）
+ */
+function parseFloat32(bytes, offset) {
+  var buf = new ArrayBuffer(4);
+  var view = new DataView(buf);
+  for (var i = 0; i < 4; i++) {
+    view.setUint8(i, bytes[offset + i] || 0);
+  }
+  return view.getFloat32(0, true);
+}
+
+/**
+ * parseNormalizedValue - 解析归一化值（2字节，有符号，小端）
+ * 归一化值 = 原始值 / 32768
+ */
+function parseNormalizedValue(bytes, offset) {
+  var low = bytes[offset] || 0;
+  var high = bytes[offset + 1] || 0;
+  var raw = low | (high << 8);
+  if (raw & 0x8000) raw = raw - 0x10000;
+  return raw / 32768;
+}
+
+/**
+ * parseScaledValue - 解析标度化值（2字节，有符号整数，小端）
+ */
+function parseScaledValue(bytes, offset) {
+  var low = bytes[offset] || 0;
+  var high = bytes[offset + 1] || 0;
+  var raw = low | (high << 8);
+  if (raw & 0x8000) raw = raw - 0x10000;
+  return raw;
+}
+
+/**
+ * parseSinglePoint - 解析单点信息（1字节，bit0为状态值）
+ * 返回: { state: 0/1, quality: {}, iv: bool, nt: bool, sb: bool, bl: bool }
+ */
+function parseSinglePoint(byteVal) {
+  return {
+    state: byteVal & 0x01,
+    iv: (byteVal & 0x80) !== 0,
+    nt: (byteVal & 0x40) !== 0,
+    sb: (byteVal & 0x20) !== 0,
+    bl: (byteVal & 0x10) !== 0
+  };
+}
+
+/**
+ * parseDoublePoint - 解析双点信息（1字节，bit0-1为状态值）
+ * 0=不确定, 1=断开, 2=闭合, 3=不确定
+ */
+function parseDoublePoint(byteVal) {
+  var state = byteVal & 0x03;
+  var stateStr = ['不确定/中间态', '断开', '闭合', '不确定/故障'][state];
+  return {
+    state: state,
+    stateStr: stateStr,
+    iv: (byteVal & 0x80) !== 0,
+    nt: (byteVal & 0x40) !== 0,
+    sb: (byteVal & 0x20) !== 0,
+    bl: (byteVal & 0x10) !== 0
+  };
+}
+
+/**
+ * parseStepPosition - 解析步位置信息（状态1字节 + 步位置1字节）
+ */
+function parseStepPosition(bytes, offset) {
+  var stateByte = bytes[offset] || 0;
+  var stepByte = bytes[offset + 1] || 0;
+  var step = stepByte & 0x3F;
+  if (stepByte & 0x20) step = step - 64;
+  return {
+    state: stateByte & 0x01,
+    step: step,
+    iv: (stateByte & 0x80) !== 0,
+    nt: (stateByte & 0x40) !== 0,
+    sb: (stateByte & 0x20) !== 0,
+    bl: (stateByte & 0x10) !== 0
+  };
+}
+
+/**
+ * parseSingleCommand - 解析单点命令（1字节）
+ */
+function parseSingleCommand(byteVal) {
+  return {
+    state: byteVal & 0x01,
+    stateStr: (byteVal & 0x01) ? '合' : '分',
+    qu: (byteVal >> 2) & 0x07,
+    quStr: ['无定义', '脉冲', '持续', '无定义'][ (byteVal >> 2) & 0x03 ] || '无定义',
+    se: (byteVal & 0x80) !== 0
+  };
+}
+
+/**
+ * parseDoubleCommand - 解析双点命令（1字节）
+ */
+function parseDoubleCommand(byteVal) {
+  var dcs = byteVal & 0x03;
+  var dcsStr = ['不允许', '断开', '闭合', '不允许'][dcs] || '不允许';
+  return {
+    dcs: dcs,
+    dcsStr: dcsStr,
+    qu: (byteVal >> 2) & 0x07,
+    quStr: ['无定义', '脉冲', '持续', '无定义'][ (byteVal >> 2) & 0x03 ] || '无定义',
+    se: (byteVal & 0x80) !== 0
+  };
+}
+
+/**
+ * parseInformationObjects - 解析信息对象列表
+ * @param {number[]} bytes - 完整报文字节数组
+ * @param {object} asdu - ASDU解析结果
+ * @returns {object[]} 信息对象数组
+ */
+function parseInformationObjects(bytes, asdu) {
+  var typeId = asdu.typeId;
+  var sq = asdu.sq;
+  var count = asdu.infoObjCount;
+  var hasTimestamp = asdu.hasTimestamp;
+  var infoObjects = [];
+
+  if (count <= 0) return infoObjects;
+
+  var infoSize = getInfoElementSize(typeId);
+  var i, offset, ioa, obj;
+
+  if (!sq) {
+    var ioaOffset = 12;
+    for (i = 0; i < count; i++) {
+      if (bytes.length <= ioaOffset + 2) break;
+
+      ioa = bytes[ioaOffset] | (bytes[ioaOffset + 1] << 8) | (bytes[ioaOffset + 2] << 16);
+      var infoOffset = ioaOffset + 3;
+
+      obj = { index: i + 1, ioa: ioa, ioaHex: '0x' + ioa.toString(16).toUpperCase() };
+
+      if (bytes.length >= infoOffset + infoSize) {
+        parseInfoElement(typeId, bytes, infoOffset, obj);
+      }
+
+      infoObjects.push(obj);
+      ioaOffset = infoOffset + infoSize;
+    }
+  } else {
+    if (bytes.length <= 17) return infoObjects;
+    ioa = bytes[12] | (bytes[13] << 8) | (bytes[14] << 16);
+    offset = 15;
+
+    for (i = 0; i < count; i++) {
+      obj = { index: i + 1, ioa: ioa + i, ioaHex: '0x' + (ioa + i).toString(16).toUpperCase() };
+      if (bytes.length >= offset + infoSize) {
+        parseInfoElement(typeId, bytes, offset, obj);
+      }
+      infoObjects.push(obj);
+      offset += infoSize;
+    }
+  }
+
+  return infoObjects;
+}
+
+/**
+ * getInfoElementSize - 获取单个信息元素的字节大小
+ */
+function getInfoElementSize(typeId) {
+  switch (typeId) {
+    case 1: case 2: case 20: case 30:
+      return 1;
+    case 3: case 4: case 21: case 31:
+      return 1;
+    case 5: case 7: case 34:
+      return 2;
+    case 9: case 10:
+      return 2;
+    case 11: case 12:
+      return 2;
+    case 13: case 14:
+      return 4;
+    case 15:
+      return 2;
+    case 45: case 58:
+      return 1;
+    case 46: case 59:
+      return 1;
+    case 47:
+      return 1;
+    case 48:
+      return 2;
+    case 49:
+      return 2;
+    case 50:
+      return 4;
+    default:
+      return 1;
+  }
+}
+
+/**
+ * parseInfoElement - 解析单个信息元素，将结果写入 obj
+ */
+function parseInfoElement(typeId, bytes, offset, obj) {
+  switch (typeId) {
+    case 1: case 2: case 20: case 30:
+      var sp = parseSinglePoint(bytes[offset]);
+      obj.value = sp.state;
+      obj.valueStr = sp.state ? '合/1' : '分/0';
+      obj.quality = sp;
+      break;
+    case 3: case 4: case 21: case 31:
+      var dp = parseDoublePoint(bytes[offset]);
+      obj.value = dp.state;
+      obj.valueStr = dp.stateStr;
+      obj.quality = dp;
+      break;
+    case 5: case 7: case 34:
+      var st = parseStepPosition(bytes, offset);
+      obj.value = st.step;
+      obj.valueStr = '第 ' + st.step + ' 步';
+      obj.quality = st;
+      break;
+    case 9: case 10:
+      var nv = parseNormalizedValue(bytes, offset);
+      obj.value = nv;
+      obj.valueStr = nv.toFixed(6);
+      break;
+    case 11: case 12:
+      var sv = parseScaledValue(bytes, offset);
+      obj.value = sv;
+      obj.valueStr = sv.toString();
+      break;
+    case 13: case 14:
+      var fv = parseFloat32(bytes, offset);
+      obj.value = fv;
+      obj.valueStr = fv.toFixed(4);
+      break;
+    case 15:
+      var nv2 = parseNormalizedValue(bytes, offset);
+      obj.value = nv2;
+      obj.valueStr = nv2.toFixed(6);
+      break;
+    case 45: case 58:
+      var sc = parseSingleCommand(bytes[offset]);
+      obj.value = sc.state;
+      obj.valueStr = sc.stateStr;
+      obj.quStr = sc.quStr;
+      obj.se = sc.se;
+      break;
+    case 46: case 59:
+      var dc = parseDoubleCommand(bytes[offset]);
+      obj.value = dc.dcs;
+      obj.valueStr = dc.dcsStr;
+      obj.quStr = dc.quStr;
+      obj.se = dc.se;
+      break;
+    case 47:
+      var rcs = bytes[offset] & 0x07;
+      var rcsStr = ['不允许', '下降', '上升', '不允许', '不允许', '不允许', '不允许', '不允许'][rcs];
+      obj.value = rcs;
+      obj.valueStr = rcsStr;
+      break;
+    case 48:
+      var setNv = parseNormalizedValue(bytes, offset);
+      obj.value = setNv;
+      obj.valueStr = setNv.toFixed(6);
+      break;
+    case 49:
+      var setSv = parseScaledValue(bytes, offset);
+      obj.value = setSv;
+      obj.valueStr = setSv.toString();
+      break;
+    case 50:
+      var setFv = parseFloat32(bytes, offset);
+      obj.value = setFv;
+      obj.valueStr = setFv.toFixed(4);
+      break;
+    default:
+      obj.value = bytes[offset];
+      obj.valueStr = '0x' + bytes[offset].toString(16).toUpperCase();
+      break;
+  }
+}
+
+/**
+ * getTypeCategory - 获取类型分类
+ */
+function getTypeCategory(typeId) {
+  return TYPE_CATEGORY_MAP[typeId] || '其他';
+}
+
+/**
+ * diagnoseContext - 多端口上下文诊断
+ * @param {number} port - 端口号
+ * @param {string} frameType - 帧类型 I/S/U
+ * @param {number|null} ns - I帧的N(S)
+ * @param {number|null} nr - I帧或S帧的N(R)
+ * @param {string|null} uFuncType - U帧功能类型
+ * @returns {object} 诊断结果 { level: 'ok'|'warn'|'info', messages: [] }
+ */
+function diagnoseContext(port, frameType, ns, nr, uFuncType) {
+  var ctx = portContexts[port];
+  var result = { level: 'ok', messages: [] };
+
+  if (!ctx) {
+    result.level = 'info';
+    result.messages.push('端口 ' + port + ' 无上下文记录');
+    return result;
+  }
+
+  if (frameType === 'I') {
+    // 检查N(S)连续性
+    if (ctx.lastNS !== null) {
+      var expectedNS = (ctx.lastNS + 1) & 0x7FFF;
+      if (ns !== expectedNS) {
+        result.level = 'warn';
+        result.messages.push('警告：[端口' + port + '] I帧N(S)=' + ns + '，期望N(S)=' + expectedNS + '，序列号跳变，疑似丢帧！');
+      } else {
+        result.messages.push('[端口' + port + '] I帧序列号正常，N(S)=' + ns);
+      }
+    } else {
+      result.messages.push('[端口' + port + '] 首次收到I帧，N(S)=' + ns);
+    }
+    // 更新上下文
+    ctx.lastNS = ns;
+    ctx.lastNR = nr;
+  } else if (frameType === 'S') {
+    // 检查S帧N(R)是否确认了之前收到的I帧
+    // N(R)表示期望下一个收到的I帧N(S)，正常确认时 N(R) <= lastNS + 1
+    if (ctx.lastNS !== null) {
+      if (nr <= ctx.lastNS + 1) {
+        var confirmedNS = (nr - 1 < 0) ? nr - 1 + 32768 : nr - 1;
+        result.messages.push('[端口' + port + '] S帧确认N(R)=' + nr + '，已确认到I帧N(S)=' + confirmedNS);
+      } else {
+        result.level = 'warn';
+        result.messages.push('警告：[端口' + port + '] S帧确认号N(R)=' + nr + '异常，超出已收I帧N(S)+1=' + (ctx.lastNS + 1));
+      }
+    } else {
+      result.messages.push('[端口' + port + '] S帧N(R)=' + nr + '，无先前I帧记录');
+    }
+    ctx.sFrameNR = nr;
+  } else if (frameType === 'U') {
+    // 检查U帧配对
+    if (U_ACT_SET[uFuncType]) {
+      // 这是一条激活命令
+      if (ctx.uPending) {
+        result.level = 'warn';
+        result.messages.push('警告：[端口' + port + '] 收到' + uFuncType.replace(/_/g,' ') + '，但上一条' + ctx.uPendingType.replace(/_/g,' ') + '尚未确认！');
+      } else {
+        result.messages.push('[端口' + port + '] 收到' + uFuncType.replace(/_/g,' ') + '命令');
+      }
+      ctx.uPending = true;
+      ctx.uPendingType = uFuncType;
+    } else {
+      // 这是一条确认
+      var expectedAct = null;
+      for (var act in U_PAIR) {
+        if (U_PAIR[act] === uFuncType) { expectedAct = act; break; }
+      }
+      if (ctx.uPending && ctx.uPendingType === expectedAct) {
+        result.messages.push('[端口' + port + '] ' + uFuncType.replace(/_/g,' ') + '，与' + expectedAct.replace(/_/g,' ') + '配对正常');
+        ctx.uPending = false;
+        ctx.uPendingType = null;
+      } else if (ctx.uPending) {
+        result.level = 'warn';
+        var waitingFor = U_PAIR[ctx.uPendingType] || '未知';
+        result.messages.push('警告：[端口' + port + '] 收到' + uFuncType.replace(/_/g,' ') + '，但等待的是' + waitingFor.replace(/_/g,' '));
+        ctx.uPending = false;
+        ctx.uPendingType = null;
+      } else {
+        result.level = 'info';
+        result.messages.push('[端口' + port + '] 收到' + uFuncType.replace(/_/g,' ') + '，无未确认的激活命令');
+      }
+    }
+    ctx.lastUFrame = uFuncType;
+  }
+
+  if (result.level === 'ok' && result.messages.length === 0) {
+    result.messages.push('该报文在当前端口上下文中判定为：正常');
+  }
+
+  return result;
+}
+
+/* ==========================================================
+   UI渲染函数
+   ========================================================== */
+
+/**
+ * formatResult - 将解析结果渲染为HTML卡片
+ */
+function formatResult(bytes, apci, asdu, lenCheck, diag) {
+  var html = '';
+
+  // ── 长度校验 ──
+  if (lenCheck.ok) {
+    html += '<div class="len-ok">\u2705 长度校验通过（Length=' + lenCheck.lengthField + '，实际=' + lenCheck.actualLength + '）</div>';
+  } else {
+    html += '<div class="len-fail">\uD83D\uDEA8 长度异常！期望 ' + lenCheck.lengthField + ' 字节，实际 ' + lenCheck.actualLength + ' 字节</div>';
+  }
+
+  // ── APCI卡片 ──
+  html += '<div class="card">';
+  html += '<div class="card-title apci">APCI 层</div>';
+  html += '<div class="field"><span class="field-label">启动字符</span><span class="field-value">0x' + apci.startChar.toString(16).toUpperCase().padStart(2, '0') + (apci.startChar === 0x68 ? ' (68H\u2714)' : ' (\u26A0非68H)') + '</span></div>';
+  html += '<div class="field"><span class="field-label">APDU长度</span><span class="field-value' + (lenCheck.ok ? ' highlight' : ' warn') + '">' + apci.lengthField + ' 字节</span></div>';
+  html += '<div class="field"><span class="field-label">帧类型</span><span class="field-value highlight">' + apci.frameType + '帧</span></div>';
+
+  // 控制域字节
+  html += '<div class="field"><span class="field-label">控制域</span><span class="field-value" style="font-family:monospace">' +
+    '0x' + apci.controlField[0].toString(16).toUpperCase().padStart(2,'0') + ' ' +
+    '0x' + apci.controlField[1].toString(16).toUpperCase().padStart(2,'0') + ' ' +
+    '0x' + apci.controlField[2].toString(16).toUpperCase().padStart(2,'0') + ' ' +
+    '0x' + apci.controlField[3].toString(16).toUpperCase().padStart(2,'0') +
+    '</span></div>';
+
+  if (apci.frameType === 'I') {
+    html += '<div class="field"><span class="field-label">N(S) 发送序列号</span><span class="field-value info">' + apci.ns + '</span></div>';
+    html += '<div class="field"><span class="field-label">N(R) 接收序列号</span><span class="field-value info">' + apci.nr + '</span></div>';
+  } else if (apci.frameType === 'S') {
+    html += '<div class="field"><span class="field-label">N(R) 接收序列号</span><span class="field-value info">' + apci.nr + '</span></div>';
+  } else if (apci.frameType === 'U') {
+    html += '<div class="field"><span class="field-label">U帧功能</span><span class="field-value highlight">' + apci.uFuncName + '</span></div>';
+  }
+  html += '</div>';
+
+  // ── ASDU卡片 ──
+  if (asdu) {
+    html += '<div class="card">';
+    html += '<div class="card-title asdu">ASDU 层</div>';
+    html += '<div class="field"><span class="field-label">类型标识 (TYPE ID)</span><span class="field-value highlight">' + asdu.typeId + ' - ' + asdu.typeName + '</span></div>';
+    html += '<div class="field"><span class="field-label">类型分类</span><span class="field-value" style="color:#ffd166;font-weight:700">' + asdu.typeCategory + '</span></div>';
+    html += '<div class="field"><span class="field-label">VSQ</span><span class="field-value">0x' + asdu.vsq.toString(16).toUpperCase().padStart(2,'0') + '</span></div>';
+    html += '<div class="field"><span class="field-label">信息体个数</span><span class="field-value info">' + asdu.infoObjCount + '</span></div>';
+    html += '<div class="field"><span class="field-label">传输方式</span><span class="field-value">' + (asdu.sq ? '顺序传输 (SQ=1)' : '非顺序传输 (SQ=0)') + '</span></div>';
+    html += '<div class="field"><span class="field-label">传送原因 (COT)</span><span class="field-value">' + asdu.cot + ' - ' + asdu.cotName + '</span></div>';
+    html += '<div class="field"><span class="field-label">原地址 (OA)</span><span class="field-value">' + asdu.oa + '</span></div>';
+    html += '<div class="field"><span class="field-label">公共地址 (CA)</span><span class="field-value info">' + asdu.ca + '</span></div>';
+    if (asdu.ioa !== null) {
+      html += '<div class="field"><span class="field-label">信息对象地址 (IOA)</span><span class="field-value info">' + asdu.ioa + ' (' + asdu.ioaHex + ')</span></div>';
+    }
+    if (asdu.timestampStr) {
+      html += '<div class="field"><span class="field-label">时标 (CP56Time2a)</span><span class="field-value highlight">' + asdu.timestampStr + '</span></div>';
+    }
+
+    // 信息对象列表
+    if (asdu.infoObjects && asdu.infoObjects.length > 0) {
+      html += '<div class="info-objects-section">';
+      html += '<div class="info-objects-title">' + asdu.typeCategory + '点位明细（共 ' + asdu.infoObjects.length + ' 个）</div>';
+      for (var k = 0; k < asdu.infoObjects.length; k++) {
+        var io = asdu.infoObjects[k];
+        html += '<div class="info-object-item">';
+        html += '<span class="io-index">第 ' + io.index + ' 位</span>';
+        html += '<span class="io-ioa">IOA: ' + io.ioa + ' (' + io.ioaHex + ')</span>';
+        if (io.valueStr !== undefined) {
+          html += '<span class="io-value">' + io.valueStr + '</span>';
+        }
+        if (io.quality && io.quality.iv) {
+          html += '<span class="io-quality" style="color:#e94560">[无效]</span>';
+        }
+        if (io.quStr) {
+          html += '<span class="io-qu">[' + io.quStr + ']</span>';
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+
+    // 显示ASDU原始字节
+    html += '<div class="field"><span class="field-label">ASDU原始</span><span class="field-value" style="font-family:monospace;font-size:12px;word-break:break-all">' +
+      asdu.rawAsdu.map(function(b){ return b.toString(16).toUpperCase().padStart(2,'0'); }).join(' ') + '</span></div>';
+
+    html += '</div>';
+  }
+
+  // ── 诊断卡片 ──
+  html += '<div class="card">';
+  html += '<div class="card-title diag">上下文诊断（端口 ' + currentPort + '）</div>';
+  for (var i = 0; i < diag.messages.length; i++) {
+    var cls = diag.level === 'warn' ? 'diag-warn' : (diag.level === 'info' ? 'diag-info' : 'diag-ok');
+    html += '<div class="' + cls + '">' + diag.messages[i] + '</div>';
+  }
+  html += '</div>';
+
+  return html;
+}
+
+/**
+ * updatePortStatus - 更新端口状态面板
+ */
+function updatePortStatus() {
+  var ctx = portContexts[currentPort];
+  if (!ctx) return;
+  var html = '<div class="port-status-title">端口 ' + currentPort + ' 状态</div>';
+  html += '<div class="port-status-item">';
+  html += '<span>I帧N(S): ' + (ctx.lastNS !== null ? ctx.lastNS : '-') + '</span>';
+  html += '<span>I帧N(R): ' + (ctx.lastNR !== null ? ctx.lastNR : '-') + '</span>';
+  html += '<span>S帧N(R): ' + (ctx.sFrameNR !== null ? ctx.sFrameNR : '-') + '</span>';
+  html += '<span>U帧: ' + (ctx.lastUFrame || '-') + '</span>';
+  html += '<span>未确认: ' + (ctx.uPending ? ctx.uPendingType : '无') + '</span>';
+  html += '</div>';
+  document.getElementById('portStatus').innerHTML = html;
+}
+
+/**
+ * addHistoryItem - 添加历史记录
+ */
+function addHistoryItem(hexStr, summary) {
+  var ctx = portContexts[currentPort];
+  if (!ctx) return;
+  ctx.history.unshift({ hex: hexStr, summary: summary, time: new Date().toLocaleTimeString() });
+  if (ctx.history.length > 20) ctx.history.pop();
+  renderHistory();
+}
+
+/**
+ * renderHistory - 渲染历史记录
+ */
+function renderHistory() {
+  var ctx = portContexts[currentPort];
+  if (!ctx || ctx.history.length === 0) {
+    document.getElementById('historySection').innerHTML = '';
+    return;
+  }
+  var html = '<h3>解析历史（端口 ' + currentPort + '）</h3>';
+  for (var i = 0; i < ctx.history.length; i++) {
+    var h = ctx.history[i];
+    html += '<div class="history-item" onclick="document.getElementById(\'hexInput\').value=\'' + h.hex.replace(/'/g,"\\'") + '\'">';
+    html += '<span class="hi-port">[' + h.time + ']</span> ';
+    html += '<span class="hi-hex">' + h.hex.substring(0, 40) + (h.hex.length > 40 ? '...' : '') + '</span><br>';
+    html += '<span class="hi-summary">' + h.summary + '</span>';
+    html += '</div>';
+  }
+  document.getElementById('historySection').innerHTML = html;
+}
+
+/* ==========================================================
+   主解析入口
+   ========================================================== */
+
+/**
+ * formatResultInner - 渲染解析内容（无外层card包裹），供单条/批量复用
+ */
+function formatResultInner(bytes, apci, asdu, lenCheck, diag) {
+  var html = '';
+  if (lenCheck.ok) {
+    html += '<div class="len-ok">\u2705 长度校验通过（Length=' + lenCheck.lengthField + '，实际=' + lenCheck.actualLength + '）</div>';
+  } else {
+    html += '<div class="len-fail">\uD83D\uDEA8 长度异常！期望 ' + lenCheck.lengthField + ' 字节，实际 ' + lenCheck.actualLength + ' 字节</div>';
+  }
+  html += '<div class="field"><span class="field-label">启动字符</span><span class="field-value">0x' + apci.startChar.toString(16).toUpperCase().padStart(2, '0') + (apci.startChar === 0x68 ? ' (68H\u2714)' : ' (\u26A0非68H)') + '</span></div>';
+  html += '<div class="field"><span class="field-label">APDU长度</span><span class="field-value' + (lenCheck.ok ? ' highlight' : ' warn') + '">' + apci.lengthField + ' 字节</span></div>';
+  html += '<div class="field"><span class="field-label">帧类型</span><span class="field-value highlight">' + apci.frameType + '帧</span></div>';
+  html += '<div class="field"><span class="field-label">控制域</span><span class="field-value" style="font-family:monospace">' +
+    '0x' + apci.controlField[0].toString(16).toUpperCase().padStart(2,'0') + ' ' +
+    '0x' + apci.controlField[1].toString(16).toUpperCase().padStart(2,'0') + ' ' +
+    '0x' + apci.controlField[2].toString(16).toUpperCase().padStart(2,'0') + ' ' +
+    '0x' + apci.controlField[3].toString(16).toUpperCase().padStart(2,'0') + '</span></div>';
+  if (apci.frameType === 'I') {
+    html += '<div class="field"><span class="field-label">N(S) 发送序列号</span><span class="field-value info">' + apci.ns + '</span></div>';
+    html += '<div class="field"><span class="field-label">N(R) 接收序列号</span><span class="field-value info">' + apci.nr + '</span></div>';
+  } else if (apci.frameType === 'S') {
+    html += '<div class="field"><span class="field-label">N(R) 接收序列号</span><span class="field-value info">' + apci.nr + '</span></div>';
+  } else if (apci.frameType === 'U') {
+    html += '<div class="field"><span class="field-label">U帧功能</span><span class="field-value highlight">' + apci.uFuncName + '</span></div>';
+  }
+  if (asdu) {
+    html += '<div style="margin-top:6px;padding-top:4px;border-top:1px dashed #0f346066"></div>';
+    html += '<div class="field"><span class="field-label">类型标识 (TYPE ID)</span><span class="field-value highlight">' + asdu.typeId + ' - ' + asdu.typeName + '</span></div>';
+    html += '<div class="field"><span class="field-label">类型分类</span><span class="field-value" style="color:#ffd166;font-weight:700">' + asdu.typeCategory + '</span></div>';
+    html += '<div class="field"><span class="field-label">VSQ</span><span class="field-value">0x' + asdu.vsq.toString(16).toUpperCase().padStart(2,'0') + '</span></div>';
+    html += '<div class="field"><span class="field-label">信息体个数</span><span class="field-value info">' + asdu.infoObjCount + '</span></div>';
+    html += '<div class="field"><span class="field-label">传输方式</span><span class="field-value">' + (asdu.sq ? '顺序传输 (SQ=1)' : '非顺序传输 (SQ=0)') + '</span></div>';
+    html += '<div class="field"><span class="field-label">传送原因 (COT)</span><span class="field-value">' + asdu.cot + ' - ' + asdu.cotName + '</span></div>';
+    html += '<div class="field"><span class="field-label">原地址 (OA)</span><span class="field-value">' + asdu.oa + '</span></div>';
+    html += '<div class="field"><span class="field-label">公共地址 (CA)</span><span class="field-value info">' + asdu.ca + '</span></div>';
+    if (asdu.ioa !== null) {
+      html += '<div class="field"><span class="field-label">信息对象地址 (IOA)</span><span class="field-value info">' + asdu.ioa + ' (' + asdu.ioaHex + ')</span></div>';
+    }
+    if (asdu.timestampStr) {
+      html += '<div class="field"><span class="field-label">时标 (CP56Time2a)</span><span class="field-value highlight">' + asdu.timestampStr + '</span></div>';
+    }
+
+    // 信息对象列表
+    if (asdu.infoObjects && asdu.infoObjects.length > 0) {
+      html += '<div class="info-objects-section">';
+      html += '<div class="info-objects-title">' + asdu.typeCategory + '点位明细（共 ' + asdu.infoObjects.length + ' 个）</div>';
+      for (var k = 0; k < asdu.infoObjects.length; k++) {
+        var io = asdu.infoObjects[k];
+        html += '<div class="info-object-item">';
+        html += '<span class="io-index">第 ' + io.index + ' 位</span>';
+        html += '<span class="io-ioa">IOA: ' + io.ioa + ' (' + io.ioaHex + ')</span>';
+        if (io.valueStr !== undefined) {
+          html += '<span class="io-value">' + io.valueStr + '</span>';
+        }
+        if (io.quality && io.quality.iv) {
+          html += '<span class="io-quality" style="color:#e94560">[无效]</span>';
+        }
+        if (io.quStr) {
+          html += '<span class="io-qu">[' + io.quStr + ']</span>';
+        }
+        html += '</div>';
+      }
+      html += '</div>';
+    }
+    html += '<div class="field"><span class="field-label">ASDU原始</span><span class="field-value" style="font-family:monospace;font-size:12px;word-break:break-all">' +
+      asdu.rawAsdu.map(function(b){ return b.toString(16).toUpperCase().padStart(2,'0'); }).join(' ') + '</span></div>';
+  }
+  html += '<div style="margin-top:6px;padding-top:4px;border-top:1px dashed #0f346066"></div>';
+  for (var i = 0; i < diag.messages.length; i++) {
+    var cls = diag.level === 'warn' ? 'diag-warn' : (diag.level === 'info' ? 'diag-info' : 'diag-ok');
+    html += '<div class="' + cls + '">' + diag.messages[i] + '</div>';
+  }
+  return html;
+}
+
+/**
+ * renderOneMessage - 渲染批量模式下单条报文卡片
+ */
+function renderOneMessage(msg, idx) {
+  var bytes = msg.bytes;
+  var html = '';
+  var borderColor = msg.dir === 'R' ? '#00ff88' : (msg.dir === 'S' ? '#ff9f43' : '#00d2ff');
+  html += '<div class="card" style="border-left:4px solid ' + borderColor + '">';
+  var dirTag = msg.dir ? '<span style="color:' + (msg.dir === 'R' ? '#00ff88' : '#ff9f43') + ';font-weight:700">[' + msg.dir + ']</span>' : '';
+  var timeTag = msg.time ? '<span style="color:#80a0c0">' + msg.time + '</span>' : '';
+  html += '<div class="card-title apci" style="font-size:14px">#' + idx + ' ' + dirTag + ' ' + timeTag + '</div>';
+  html += '<div class="field"><span class="field-label">原始报文</span><span class="field-value" style="font-family:monospace;font-size:12px;word-break:break-all">' + msg.rawHex + '</span></div>';
+  if (bytes.length < 6) {
+    html += '<div class="field-value warn">报文过短，APDU至少需要6字节</div></div>';
+    return html;
+  }
+  if (bytes[0] !== 0x68) {
+    html += '<div class="field-value warn">启动字符错误，应为0x68</div></div>';
+    return html;
+  }
+  var apci = parseAPCI(bytes);
+  var asdu = parseASDU(bytes);
+  var lenCheck = validateLength(bytes);
+  var diag = diagnoseContext(currentPort, apci.frameType, apci.ns, apci.nr, apci.uFuncType);
+  html += formatResultInner(bytes, apci, asdu, lenCheck, diag);
+  html += '</div>';
+  return html;
+}
+
+function onParse() {
+  var input = document.getElementById('hexInput').value;
+  var messages = parseMultiFrames(input);
+
+  if (!messages || messages.length === 0) {
+    document.getElementById('resultSection').innerHTML =
+      '<div class="card"><div class="card-title apci" style="color:#e94560">解析失败</div>' +
+      '<div class="field-value warn">未找到有效的IEC 104报文（未检测到0x68启动字符）</div></div>';
+    return;
+  }
+
+  var html = '';
+
+  if (messages.length === 1) {
+    var m = messages[0];
+    var bytes = m.bytes;
+    var apci = parseAPCI(bytes);
+    var asdu = parseASDU(bytes);
+    var lenCheck = validateLength(bytes);
+    var diag = diagnoseContext(currentPort, apci.frameType, apci.ns, apci.nr, apci.uFuncType);
+    html = formatResult(bytes, apci, asdu, lenCheck, diag);
+
+    var summary = apci.frameType + '帧' + (apci.frameType === 'U' ? ' - ' + apci.uFuncName : '') +
+      (apci.frameType === 'I' ? ' N(S)=' + apci.ns + ' N(R)=' + apci.nr : '') +
+      (apci.frameType === 'S' ? ' N(R)=' + apci.nr : '') +
+      (asdu ? ' | ' + asdu.typeName : '');
+    addHistoryItem(m.rawHex, summary);
+  } else {
+    // 统计
+    var iCount = 0, sCount = 0, uCount = 0, warnCount = 0;
+    for (var k = 0; k < messages.length; k++) {
+      var a = parseAPCI(messages[k].bytes);
+      if (a.frameType === 'I') iCount++;
+      else if (a.frameType === 'S') sCount++;
+      else if (a.frameType === 'U') uCount++;
+    }
+    html += '<div class="card" style="border-left:4px solid #a29bfe">';
+    html += '<div class="card-title diag">批量解析结果</div>';
+    html += '<div class="field"><span class="field-label">报文总数</span><span class="field-value highlight">' + messages.length + ' 条</span></div>';
+    html += '<div class="field"><span class="field-label">I帧 / S帧 / U帧</span><span class="field-value">' + iCount + ' / ' + sCount + ' / ' + uCount + '</span></div>';
+    html += '<div class="field"><span class="field-label">时间范围</span><span class="field-value info">' + (messages[0].time || '-') + ' ~ ' + (messages[messages.length-1].time || '-') + '</span></div>';
+    html += '</div>';
+
+    for (var i = 0; i < messages.length; i++) {
+      html += renderOneMessage(messages[i], i + 1);
+    }
+
+    var hexBrief = messages.length + '条报文（' + (messages[0].time || '') + ' ~ ' + (messages[messages.length-1].time || '') + '）';
+    addHistoryItem(input.trim().substring(0, 60) + (input.length > 60 ? '...' : ''), hexBrief);
+  }
+
+  document.getElementById('resultSection').innerHTML = html;
+  updatePortStatus();
+}
+
+/**
+ * onClear - 清空输入和结果
+ */
+function onClear() {
+  document.getElementById('hexInput').value = '';
+  document.getElementById('resultSection').innerHTML = '';
+}
+
+/**
+ * addPort - 添加新端口
+ */
+function addPort() {
+  var portNum = prompt('请输入端口号：', '2405');
+  if (!portNum) return;
+  portNum = parseInt(portNum, 10);
+  if (isNaN(portNum) || portNum < 1 || portNum > 65535) {
+    alert('端口号无效（1-65535）');
+    return;
+  }
+  if (portContexts[portNum]) {
+    alert('端口 ' + portNum + ' 已存在');
+    return;
+  }
+  portContexts[portNum] = { lastNS: null, lastNR: null, sFrameNR: null, lastUFrame: null, uPending: false, uPendingType: null, history: [] };
+
+  // 添加到下拉框
+  var sel = document.getElementById('portSelect');
+  var opt = document.createElement('option');
+  opt.value = portNum;
+  opt.textContent = portNum;
+  sel.appendChild(opt);
+  sel.value = portNum;
+  currentPort = portNum;
+  updatePortStatus();
+  renderHistory();
+}
+
+/**
+ * removePort - 删除当前端口
+ */
+function removePort() {
+  var sel = document.getElementById('portSelect');
+  if (sel.options.length <= 1) {
+    alert('至少保留一个端口');
+    return;
+  }
+  var portNum = parseInt(sel.value, 10);
+  delete portContexts[portNum];
+  // 移除选项
+  for (var i = 0; i < sel.options.length; i++) {
+    if (parseInt(sel.options[i].value, 10) === portNum) {
+      sel.remove(i);
+      break;
+    }
+  }
+  sel.selectedIndex = 0;
+  currentPort = parseInt(sel.value, 10);
+  updatePortStatus();
+  renderHistory();
+}
+
+/**
+ * switchPort - 切换端口
+ */
+function switchPort(val) {
+  currentPort = parseInt(val, 10);
+  updatePortStatus();
+  renderHistory();
+}
+
+/* ==========================================================
+   示例报文
+   ========================================================== */
+var EXAMPLES = {
+  'uframe_start':     '68 04 07 00 00 00',
+  'uframe_start_ack': '68 04 0B 00 00 00',
+  'sframe':           '68 04 01 00 02 00',
+  'iframe_msp':       '68 10 00 00 02 00 01 06 03 00 01 00 01 00 00 00 00',
+  'iframe_float':     '68 14 02 00 04 00 0D 01 03 00 01 00 01 40 00 00 00 00 00 42 C8',
+  'interrogation':    '68 0E 00 00 00 00 64 01 06 00 01 00 00 00 00 00',
+  'multi_log': 'R00:02:27   68 12 C6 5C 70 06 0D 01 03 00 3F 06 46 40 00 7E 6A 74 42 00\nS00:02:27   68 04 01 00 C8 5C\nR00:02:28   68 12 C8 5C 70 06 0D 01 03 00 3F 06 44 40 00 CC A1 71 42 00\nS00:02:38   68 04 01 00 CA 5C\nR00:02:38   68 12 CA 5C 70 06 0D 01 03 00 3F 06 45 40 00 4C 37 7F 42 00\nR00:02:39   68 12 CC 5C 70 06 0D 01 03 00 3F 06 39 40 00 81 95 4D 42 00\nR00:02:45   68 12 CE 5C 70 06 0D 01 03 00 3F 06 3B 40 00 2D B2 49 42 00'
+};
+
+function loadExample(key) {
+  var hex = EXAMPLES[key];
+  if (hex) {
+    document.getElementById('hexInput').value = hex;
+  }
+}
+
+/* ==========================================================
+   初始化
+   ========================================================== */
+updatePortStatus();
+</script>
+
+</body>
+</html>
